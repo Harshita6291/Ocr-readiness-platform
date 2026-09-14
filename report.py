@@ -199,3 +199,136 @@ def generate_pdf_report(
 
     doc.build(story)
     return buf.getvalue()
+
+
+def generate_batch_pdf_report(
+    batch_data: List[Dict[str, Any]],
+) -> bytes:
+    """
+    Generates a multi-page PDF report summarizing a batch of analyzed images.
+    """
+    buf = io.BytesIO()
+    doc = SimpleDocTemplate(
+        buf,
+        pagesize=A4,
+        leftMargin=1.5*cm,
+        rightMargin=1.5*cm,
+        topMargin=1.5*cm,
+        bottomMargin=1.5*cm,
+    )
+
+    styles = getSampleStyleSheet()
+    title_style = ParagraphStyle(
+        "Title",
+        parent=styles["Title"],
+        fontSize=18,
+        textColor=NAVY,
+        spaceAfter=4,
+        alignment=TA_CENTER,
+        fontName="Helvetica-Bold",
+    )
+    sub_style = ParagraphStyle(
+        "Sub",
+        parent=styles["Normal"],
+        fontSize=9,
+        textColor=colors.grey,
+        alignment=TA_CENTER,
+        spaceAfter=10,
+    )
+    section_style = ParagraphStyle(
+        "Section",
+        parent=styles["Normal"],
+        fontSize=11,
+        textColor=NAVY,
+        spaceBefore=10,
+        spaceAfter=4,
+        fontName="Helvetica-Bold",
+    )
+    body_style = ParagraphStyle(
+        "Body",
+        parent=styles["Normal"],
+        fontSize=8,
+        textColor=colors.HexColor("#333333"),
+        spaceAfter=3,
+    )
+
+    story = []
+
+    # ── Header ──────────────────────────────────
+    story.append(Paragraph("OCR Readiness Batch Analysis Report", title_style))
+    story.append(Paragraph(
+        f"Total Images Analyzed: <b>{len(batch_data)}</b> &nbsp;|&nbsp; "
+        f"Generated: {datetime.now().strftime('%d %b %Y, %H:%M')} &nbsp;|&nbsp; "
+        f"SNLP Department",
+        sub_style,
+    ))
+    story.append(HRFlowable(width="100%", thickness=2, color=TEAL, spaceAfter=8))
+
+    # ── Executive Comparison Table ──────────────
+    story.append(Paragraph("Batch Comparison Matrix", section_style))
+
+    headers = ["Image Name", "Overall Score", "Status", "Tesseract Conf"] + [DISPLAY_NAMES[k] for k in DISPLAY_NAMES.keys()]
+    table_rows = [headers]
+
+    for item in batch_data:
+        name = item.get("image_name", "Image")[:16]
+        res = item.get("results", {})
+        sc = res.get("ocr_readiness_score", 0)
+        st = res.get("ocr_readiness_status", "—")
+        conf = item.get("ocr_conf")
+        conf_str = f"{conf:.1f}%" if conf is not None else "N/A"
+        
+        row = [name, f"{sc:.1f}", st, conf_str]
+        for k in DISPLAY_NAMES.keys():
+            factor_sc = res.get(k, {}).get("score", 0)
+            row.append(f"{factor_sc}")
+        table_rows.append(row)
+
+    col_w = [2.5*cm, 1.3*cm, 1.4*cm, 1.5*cm] + [1.1*cm]*10
+    batch_table = Table(table_rows, colWidths=col_w)
+
+    t_style = TableStyle([
+        ("BACKGROUND", (0, 0), (-1, 0), NAVY),
+        ("TEXTCOLOR", (0, 0), (-1, 0), colors.white),
+        ("FONTNAME", (0, 0), (-1, 0), "Helvetica-Bold"),
+        ("FONTSIZE", (0, 0), (-1, -1), 7),
+        ("ROWBACKGROUNDS", (0, 1), (-1, -1), [colors.white, LIGHT]),
+        ("GRID", (0, 0), (-1, -1), 0.3, colors.HexColor("#CCCCCC")),
+        ("VALIGN", (0, 0), (-1, -1), "MIDDLE"),
+        ("ALIGN", (1, 0), (-1, -1), "CENTER"),
+        ("TOPPADDING", (0, 0), (-1, -1), 4),
+        ("BOTTOMPADDING", (0, 0), (-1, -1), 4),
+    ])
+    batch_table.setStyle(t_style)
+    story.append(batch_table)
+    story.append(Spacer(1, 10))
+
+    # ── Per-Image Details ────────────────────────
+    story.append(Paragraph("Detailed Per-Image Results", section_style))
+
+    for idx, item in enumerate(batch_data, start=1):
+        name = item.get("image_name", f"Image {idx}")
+        res = item.get("results", {})
+        sc = res.get("ocr_readiness_score", 0)
+        st = res.get("ocr_readiness_status", "—")
+        recs = item.get("recs", [])
+
+        story.append(Paragraph(f"<b>{idx}. {name}</b> — Score: <font color='#{_status_color(sc).hexval()[2:]}'><b>{sc}/100 ({st})</b></font>", section_style))
+        
+        # Recommendations summary
+        top_recs = [r.replace("**", "").replace("🔧", "▸").replace("✅", "✓") for r in recs[:2]]
+        for r in top_recs:
+            story.append(Paragraph(r, body_style))
+        story.append(Spacer(1, 4))
+
+    # ── Footer ───────────────────────────────────
+    story.append(Spacer(1, 12))
+    story.append(HRFlowable(width="100%", thickness=1, color=colors.lightgrey))
+    story.append(Paragraph(
+        "OCR Readiness Evaluation Platform · Batch Report · SNLP Department",
+        ParagraphStyle("Footer", parent=body_style, textColor=colors.grey,
+                       alignment=TA_CENTER, fontSize=7),
+    ))
+
+    doc.build(story)
+    return buf.getvalue()

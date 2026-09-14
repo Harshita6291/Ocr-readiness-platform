@@ -1,6 +1,7 @@
 """
 Educational content for the About Factor section.
 Each entry has: definition, importance, formula, ocr_impact, ideal_range.
+Updated to 100% match the algorithmic implementation in factors.py.
 """
 
 FACTOR_INFO = {
@@ -8,272 +9,287 @@ FACTOR_INFO = {
         "display_name": "Noise Score",
         "owner": "Yash",
         "definition": (
-            "Image noise refers to random variation of brightness or colour in pixels, "
-            "caused by sensor limitations, low light, or compression artefacts. "
-            "It appears as graininess or speckles overlaid on the true image content."
+            "Image noise refers to random high-frequency variations in brightness or color, "
+            "typically caused by sensor ISO grain, low lighting, or compression artifacts. "
+            "To prevent sharp, dense text from being penalized as noise, evaluation isolates "
+            "the flat background regions outside character strokes."
         ),
         "importance": (
-            "Noise introduces false edges and distorts character shapes. OCR engines "
-            "misread strokes that are interrupted or thickened by noise, leading to "
-            "substitution errors (e.g. 'a' read as 'o', 'l' as 'i')."
+            "Noise introduces false edge gradients and degrades character contours. In Devanagari OCR, "
+            "background grain can be misread as diacritics (like anusvara dots 'ं') or cause punctuation marks "
+            "and thin strokes to break, generating character substitution errors."
         ),
         "formula": (
-            "1. Blur the image with a 5×5 Gaussian kernel.\n"
-            "2. Subtract the blurred image from the original → residual.\n"
-            "3. Noise σ = std(residual).\n"
-            "4. Score = clamp(100 − σ / 0.5, 0, 100)."
+            "Flat-Region High-Frequency Residual Method:\n"
+            "1. Detect character stroke edges via Canny (50, 150).\n"
+            "2. Dilate edge mask (7×7 kernel) to exclude text strokes and margins.\n"
+            "3. Compute Gaussian residual on grayscale image: residual = gray − GaussianBlur(gray, 5×5).\n"
+            "4. Compute background noise standard deviation: σ = std(residual[flat_mask]).\n"
+            "5. Score = clamp(100.0 − σ / 0.30, 0, 100)."
         ),
         "ocr_impact": (
-            "High noise → OCR confidence drops sharply, especially for small fonts. "
-            "Studies show denoising alone can improve character accuracy by 10–25 %."
+            "High noise levels (σ > 15) sharply reduce OCR confidence and character accuracy. "
+            "Isolating noise to background regions ensures clean text scans maintain top scores "
+            "while recommending targeted denoising (e.g. bilateral or median filtering) when needed."
         ),
-        "ideal_range": "Score ≥ 70 (σ < 15). Excellent: Score ≥ 81.",
+        "ideal_range": "Score ≥ 70 (σ ≤ 9.0). Excellent: Score ≥ 81 (σ ≤ 5.7).",
     },
 
     "resolution_score": {
         "display_name": "Resolution Score",
         "owner": "Yash",
         "definition": (
-            "Resolution describes the pixel density of the image — how many pixels "
-            "represent each unit of physical area. For scanned documents, this is "
-            "expressed as DPI (dots per inch)."
+            "Resolution describes the total pixel detail available across the image, "
+            "measured in total Megapixels (MP = height × width / 1,000,000). Rather than evaluating "
+            "only one dimension, MP captures the true 2D character detail."
         ),
         "importance": (
-            "OCR engines need sufficient pixel detail to distinguish similar characters "
-            "('rn' vs 'm', '0' vs 'O'). Below ~150 DPI, accuracy degrades rapidly."
+            "OCR engines require sufficient pixel sampling to distinguish visually similar characters "
+            "(such as 'rn' vs 'm', '0' vs 'O', or Devanagari matras like 'ि' vs 'ी'). Below standard DPI thresholds, "
+            "fine glyph features blur into single pixel clusters."
         ),
         "formula": (
-            "1. Find long_side = max(width, height) in pixels.\n"
-            "2. Score = clamp((long_side − 200) / 13, 0, 100).\n"
-            "   Calibrated so ~1500 px long side → Score ≈ 100."
+            "Megapixel OCR Calibration Method:\n"
+            "1. Compute total image megapixels: MP = (height × width) / 1,000,000.\n"
+            "2. If MP ≥ 2.0 (standard ~300 DPI document): Score = 100.\n"
+            "3. If 1.0 ≤ MP < 2.0: Score = 70 + (MP − 1.0) × 30.\n"
+            "4. If 0.3 ≤ MP < 1.0: Score = 35 + ((MP − 0.3) / 0.7) × 35.\n"
+            "5. If MP < 0.3: Score = (MP / 0.3) × 35."
         ),
         "ocr_impact": (
-            "Tesseract is trained on 300 DPI data. Images below 200 DPI cause "
-            "character segmentation errors. Higher resolution beyond 600 DPI "
-            "shows diminishing OCR returns."
+            "Tesseract and modern OCR pipelines are trained predominantly on 300 DPI document imagery. "
+            "Resolutions below 1.0 MP cause character segmentation errors and broken loops. Beyond 2.0 MP, "
+            "OCR accuracy reaches optimal stability with diminishing returns."
         ),
-        "ideal_range": "Score ≥ 70 (≥ 1100 px long side, ~300 DPI equivalent). Excellent: ≥ 1500 px.",
+        "ideal_range": "Score ≥ 70 (≥ 1.0 MP, ~300 DPI equivalent). Excellent: Score ≥ 81 (≥ 1.37 MP).",
     },
 
     "blur_score": {
         "display_name": "Blur Score",
         "owner": "Mansi",
         "definition": (
-            "Blur is the loss of sharpness caused by camera defocus, motion during "
-            "capture, or post-processing smoothing. It manifests as soft, indistinct "
-            "edges between text strokes and background."
+            "Blur represents loss of edge sharpness caused by optical defocus, camera motion shake, "
+            "or lossy compression. It manifests as soft, wide transition gradients between text strokes "
+            "and the surrounding paper background."
         ),
         "importance": (
-            "OCR relies on detecting precise character edges. Blur spreads those edges, "
-            "making thin strokes disappear and thick strokes merge."
+            "OCR binarization algorithms rely on sharp, localized gradient peaks to define stroke perimeters. "
+            "Blur disperses edge energy, causing thin strokes to disappear and adjacent characters to merge."
         ),
         "formula": (
-            "Variance of Laplacian method:\n"
-            "1. Convert to greyscale.\n"
-            "2. Apply Laplacian operator (edge detector).\n"
-            "3. Compute variance of the resulting image.\n"
-            "4. Score = clamp(variance / 5, 0, 100)."
+            "Laplacian Variance with Logarithmic Document Scaling:\n"
+            "1. Convert to grayscale and apply mild 3×3 Gaussian smoothing.\n"
+            "2. Compute Laplacian operator (second spatial derivative): ∇²I = cv2.Laplacian(gray, CV_64F).\n"
+            "3. Calculate edge response variance: lap_var = var(∇²I).\n"
+            "4. Perceptual log-scaling: Score = clamp(((ln(1 + lap_var) − ln(1 + 3)) / (ln(1 + 600) − ln(1 + 3))) × 100, 0, 100)."
         ),
         "ocr_impact": (
-            "Blur is the single strongest predictor of OCR failure (correlation ~0.91 "
-            "in published benchmarks). A Laplacian variance below 100 reliably "
-            "indicates OCR accuracy below 80 %."
+            "Blur is consistently the single strongest predictor of OCR failure. Soft edges cause severe "
+            "under- or over-binarization, turning complex characters into unreadable blobs. Sharpening filters "
+            "or unsharp masking are recommended when blur score drops below 60."
         ),
-        "ideal_range": "Score ≥ 70 (Laplacian var ≥ 350). Excellent: var ≥ 405.",
+        "ideal_range": "Score ≥ 70 (Laplacian variance ≥ 75). Excellent: Score ≥ 81 (variance ≥ 175).",
     },
 
     "contrast_score": {
         "display_name": "Contrast Score",
         "owner": "Mansi",
         "definition": (
-            "Contrast is the difference in luminance between the darkest and brightest "
-            "regions of an image. High contrast means text strokes are clearly darker "
-            "than the page background."
+            "Contrast measures the luminance separation between foreground text ink and the background paper. "
+            "To prevent document layout density from skewing results, an Otsu-partitioned intensity difference "
+            "is computed directly between ink and background pixel clusters."
         ),
         "importance": (
-            "Low contrast forces OCR to work harder to separate foreground (ink) from "
-            "background (paper), increasing mis-segmentation and missed characters."
+            "When text contrast is low, ink intensity is nearly indistinguishable from page shading or paper tint. "
+            "Adaptive and global thresholding both fail, resulting in dropped letters, broken words, or heavy pepper noise."
         ),
         "formula": (
-            "Histogram spread method:\n"
-            "1. Convert to greyscale.\n"
-            "2. p5 = 5th percentile of pixel intensities.\n"
-            "3. p95 = 95th percentile.\n"
-            "4. spread = p95 − p5.\n"
-            "5. Score = clamp(spread / 2.55, 0, 100)."
+            "Otsu Foreground/Background Intensity Separation Method:\n"
+            "1. Convert image to grayscale.\n"
+            "2. Apply Otsu automatic thresholding to segment foreground (ink) and background (paper).\n"
+            "3. Compute mean luminance difference: contrast = mean(bg_pixels) − mean(fg_pixels).\n"
+            "4. Calibrated score: Score = clamp(((contrast − 20) / (180 − 20)) × 100, 0, 100)."
         ),
         "ocr_impact": (
-            "Contrast below 50 (spread < 128/255) is associated with 15–30 % "
-            "accuracy loss. Adaptive histogram equalisation (CLAHE) is a reliable fix."
+            "High contrast (intensity separation > 130) guarantees clean character binarization. "
+            "Separation below 60 causes characters to fade into the background during thresholding. "
+            "Contrast enhancement (like CLAHE) reliably restores readability for low-contrast scans."
         ),
-        "ideal_range": "Score ≥ 70 (intensity spread ≥ 178/255). Excellent: spread ≥ 204.",
+        "ideal_range": "Score ≥ 70 (contrast separation ≥ 132). Excellent: Score ≥ 81 (separation ≥ 150).",
     },
 
     "stroke_width_score": {
         "display_name": "Stroke Width Score",
         "owner": "Vivek",
         "definition": (
-            "Stroke width is the thickness of the lines that form character shapes. "
-            "It depends on font weight, print size, and scanning resolution. "
-            "For OCR, a consistent stroke width of 1–5 pixels is ideal."
+            "Stroke width evaluates the physical thickness of text lines relative to character height "
+            "(ratio R = W_stroke / H_char). Evaluating relative proportions rather than fixed pixel counts "
+            "ensures fair scoring across all font sizes, headings, and capture scales."
         ),
         "importance": (
-            "Very thin strokes break easily under noise or compression; very thick "
-            "strokes cause character fills and merges adjacent characters."
+            "Very thin relative strokes (R < 0.05) fragment under standard binarization, producing broken glyphs. "
+            "Very heavy strokes (R > 0.22) fill in internal character loops (counters) in letters like 'e', 'a', 'म', 'ब' "
+            "and cause adjacent glyphs to fuse together."
         ),
         "formula": (
-            "Distance-transform skeleton method:\n"
-            "1. Binarise image (Otsu).\n"
-            "2. Distance transform on text pixels.\n"
-            "3. Extract skeleton (local maxima of distance transform).\n"
-            "4. median_radius = median of distance values on skeleton.\n"
-            "5. stroke_width = median_radius × 2.\n"
-            "6. Score = clamp(100 − |stroke_width − 3| × 15, 0, 100)."
+            "Typographic Ratio & Plateau Method:\n"
+            "1. Binarize text using Otsu inversion (THRESH_BINARY_INV).\n"
+            "2. Filter valid character bounding boxes via cv2.connectedComponentsWithStats to find median character height (H_char).\n"
+            "3. Compute Euclidean Distance Transform on text pixels and extract morphological skeleton for median stroke width (W_stroke).\n"
+            "4. Calculate stroke-to-height ratio: R = W_stroke / H_char (ideal typographic ratio ~0.10–0.12).\n"
+            "5. Piecewise scoring curve:\n"
+            "   • If 0.08 ≤ R ≤ 0.15: Score = 90 + 10 × (1 − |R − 0.115| / 0.035)  [Typographic plateau]\n"
+            "   • If R < 0.08: Score = 90 × (R / 0.08)^1.3  [Thin / broken stroke falloff]\n"
+            "   • If R > 0.15: Score = 90 × exp(−0.5 × ((R − 0.15) / 0.11)^1.7)  [Heavy / bold text falloff]"
         ),
         "ocr_impact": (
-            "Optimal OCR stroke width is 2–4 px. Strokes below 1 px or above 8 px "
-            "consistently lower Tesseract confidence by 10–20 points."
+            "Optimal OCR recognition occurs when stroke width occupies 8%–15% of character height. "
+            "The calibrated plateau prevents standard bold or light typefaces from being unfairly penalized, "
+            "while strictly flagging severely eroded or over-inked text."
         ),
-        "ideal_range": "Score ≥ 70 (stroke width 2–4 px). Excellent: ~3 px.",
+        "ideal_range": "Score ≥ 70 (ratio R ≈ 0.06–0.20). Excellent: Score ≥ 81 (ratio R ≈ 0.08–0.15).",
     },
 
     "text_density_score": {
         "display_name": "Text Density Score",
         "owner": "Vivek",
         "definition": (
-            "Text density is the proportion of image pixels that belong to text "
-            "(foreground / ink) versus the total image area. It captures how "
-            "tightly packed the content is."
+            "Text density measures the proportion of image pixels occupied by dark foreground text ink "
+            "versus the total document surface area. It evaluates page layout utilization and content distribution."
         ),
         "importance": (
-            "Too sparse (< 5 %) suggests the crop includes a lot of blank space. "
-            "Too dense (> 50 %) suggests touching characters, severe clutter, "
-            "or an incorrectly thresholded image."
+            "Extremely sparse images (< 3% coverage) indicate excessive margins or empty borders that degrade resolution efficiency. "
+            "Overly packed images (> 45% coverage) suffer from touching lines, dense tabular clutter, or inverted thresholding."
         ),
         "formula": (
-            "1. Binarise image (Otsu thresholding).\n"
-            "2. density = (text pixels / total pixels) × 100.\n"
-            "3. Score = 100 × exp(−0.5 × ((density − 20) / 15)²).\n"
-            "   Bell curve peaked at 20 % coverage, std = 15 %."
+            "Gaussian Layout Density Method:\n"
+            "1. Binarize image using Otsu thresholding.\n"
+            "2. Compute coverage percentage: density_pct = (text_pixels / total_pixels) × 100.\n"
+            "3. Evaluate using Gaussian bell curve centered at 20% coverage (σ = 15%):\n"
+            "   Score = clamp(100.0 × exp(−0.5 × ((density_pct − 20.0) / 15.0)²), 0, 100)."
         ),
         "ocr_impact": (
-            "OCR performs best when text occupies 10–30 % of the image. "
-            "Extreme values indicate pre-processing problems that degrade accuracy."
+            "OCR page layout analysis engines operate with highest accuracy on balanced 10%–30% density documents. "
+            "Cropping tight text boundaries around sparse images maximizes character pixel detail and eliminates border noise."
         ),
-        "ideal_range": "Score ≥ 70 (density ≈ 10–30 %). Excellent: ≈ 15–25 %.",
+        "ideal_range": "Score ≥ 70 (density ≈ 7%–33%). Excellent: Score ≥ 81 (density ≈ 10%–30%).",
     },
 
     "matra_continuity_score": {
         "display_name": "Matra Continuity Score",
         "owner": "Krish",
         "definition": (
-            "In Devanagari script, the Shirorekha (शिरोरेखा) is the horizontal "
-            "headline that runs across the top of most characters, connecting them "
-            "into visual word units. 'Matra' broadly refers to this connecting "
-            "stroke and associated vowel marks. Continuity measures how unbroken "
-            "this line is across a text band."
+            "In Devanagari script, characters in a word hang from a continuous horizontal headline "
+            "known as the Shirorekha (शिरोरेखा). The Matra Continuity Score evaluates the continuity of this "
+            "headline across character bodies within words, alongside upper and lower vowel modifier preservation."
         ),
         "importance": (
-            "Breaks in the Shirorekha confuse Devanagari OCR engines that rely on "
-            "it for word segmentation. A broken matra often causes the engine to "
-            "split one word into two or more fragments."
+            "Devanagari OCR engines (including Tesseract's Devanagari LSTM engine) depend on the unbroken Shirorekha "
+            "for word boundary segmentation. Gaps inside words cause the OCR engine to misread a single word as multiple "
+            "disjointed characters or spurious symbols."
         ),
         "formula": (
-            "1. Binarise and find horizontal text bands via row projection.\n"
-            "2. For the top third of each band (Shirorekha zone), find the longest "
-            "   continuous horizontal run per row.\n"
-            "3. continuity = average(max_run / image_width) across all matra rows.\n"
-            "4. Score = clamp(continuity × 130, 0, 100)."
+            "Word-Span Shirorekha & Modifier Method:\n"
+            "1. Detect horizontal text bands via row projection; merge adjacent bands within 15px to preserve unified line structure.\n"
+            "2. Locate Shirorekha peak projection row in the upper 15%–45% zone of each line.\n"
+            "3. Identify word columns via character body projection in the middle zone.\n"
+            "4. Compute Shirorekha coverage across words and unbroken run length factor:\n"
+            "   run_factor = min(1.0, mean_run / 18.0)\n"
+            "   SCS = clamp(coverage × 60.0 × run_factor + min(40.0, mean_run × 1.5), 0, 100)\n"
+            "5. Combine with Upper Matra Visibility (MVS_upper), Lower Matra Visibility, Baseline Stability (BS), and Run-Length Regularity (RLR):\n"
+            "   Line MCS = 0.65 × SCS + 0.15 × MVS_upper + 0.10 × MVS_lower + 0.05 × BS + 0.05 × RLR."
         ),
         "ocr_impact": (
-            "Devanagari OCR accuracy drops 20–40 % when matra continuity score is "
-            "below 50, as the engine cannot reliably segment words."
+            "Devanagari OCR word accuracy drops 25%–50% when the Shirorekha is broken. Word-span continuity "
+            "accurately distinguishes between expected word spaces and damaging intra-word headline breaks."
         ),
-        "ideal_range": "Score ≥ 70 (avg run > 54 % of line width). Excellent: > 77 %.",
+        "ideal_range": "Score ≥ 70 (Continuous Shirorekha across word spans). Excellent: Score ≥ 81.",
     },
 
     "zone_integrity_score": {
         "display_name": "Zone Integrity Score",
         "owner": "Krish",
         "definition": (
-            "Devanagari characters are structured in three vertical zones:\n"
-            "• Upper zone — vowel marks (ā, i, ī, u, …) attached above the Shirorekha.\n"
-            "• Middle zone — main body of the consonant/akshara.\n"
-            "• Lower zone — descending vowel marks and some consonant forms.\n"
-            "Zone integrity checks whether all three zones carry pixel content in "
-            "each detected text band."
+            "Devanagari text lines are structurally partitioned into vertical zones:\n"
+            "• Upper Zone (0%–22%): ascenders and vowel signs (े, ै, ो, ौ, ं, ँ).\n"
+            "• Shirorekha Zone (22%–36%): the continuous horizontal headline.\n"
+            "• Middle Zone (36%–72%): main consonant bodies and conjuncts.\n"
+            "• Lower Zone (72%–100%): descending vowel modifiers (ु, ू, ृ, ्).\n"
+            "Zone Integrity verifies that all modifier zones remain intact, distinct, and free of degradation."
         ),
         "importance": (
-            "Missing zone data (e.g. clipped upper zone) means the OCR engine "
-            "cannot see vowel signs, causing transcription errors at every "
-            "affected character."
+            "Devanagari vowels are represented by modifying diacritics placed above and below the consonant body. "
+            "If modifier zones are clipped by page margins, smudged, or eroded into noise specks, the phonetic "
+            "identity and meaning of the words are completely lost."
         ),
         "formula": (
-            "1. Binarise and find text bands via row projection.\n"
-            "2. Split each band into three equal vertical thirds.\n"
-            "3. A band is 'intact' if all three thirds contain ≥ 2 % pixel mass.\n"
-            "4. integrity = (intact bands / total bands) × 100.\n"
-            "5. Score = clamp(integrity, 0, 100)."
+            "Unified Structural Zone Analysis Method:\n"
+            "1. Detect text lines with 15px band merging to retain upper and lower modifiers in unified bands.\n"
+            "2. Partition line into 4 vertical zones: Upper (0–22%), Shiro (22–36%), Middle (36–72%), Lower (72–100%).\n"
+            "3. Evaluate each zone for component health:\n"
+            "   • clean_ratio = components with area ≥ 8 px / total components\n"
+            "   • noise_ratio = tiny noise specks < 6 px / total components\n"
+            "   • cov = standard deviation / mean of distance transform values in zone\n"
+            "   • Zone Score = clamp(100 × clean_ratio − 40 × noise_ratio − max(0, (cov − 0.4) × 50), 10, 100)\n"
+            "4. Combine zones with Pal-Chaudhuri weights: ZIS = 0.25 × Z_upper + 0.30 × Z_shiro + 0.30 × Z_mid + 0.15 × Z_lower."
         ),
         "ocr_impact": (
-            "Zone clipping is particularly harmful for Devanagari. Even a single "
-            "missing upper-zone vowel mark changes word meaning entirely."
+            "Clipped or damaged modifier zones cause OCR engines to misrecognize or omit vowels entirely. "
+            "Ensuring intact zones preserves full lexical accuracy for Indian languages."
         ),
-        "ideal_range": "Score ≥ 70 (≥ 70 % of bands fully intact). Excellent: ≥ 81 %.",
+        "ideal_range": "Score ≥ 70 (All modifier zones intact and well-separated). Excellent: Score ≥ 81.",
     },
 
     "connected_component_stability_score": {
         "display_name": "Connected Component Stability Score",
         "owner": "Tanusha",
         "definition": (
-            "A 'connected component' is a group of touching foreground pixels — "
-            "typically a single character or character part. Stability measures "
-            "how uniform the sizes of these components are across the image."
+            "A connected component represents a contiguous cluster of foreground pixels — typically "
+            "a character, conjunct, or modifier. CC Stability measures the size consistency of these components "
+            "using the Coefficient of Variation (CV = std / mean of component areas)."
         ),
         "importance": (
-            "Clean, well-printed text produces characters of fairly consistent "
-            "size. Noise, broken strokes, smudges, or stray marks create extra "
-            "components of very different sizes, which confuses the OCR "
-            "segmentation step."
+            "Uniform character sizes indicate clean print quality and proper segmentation. Heavy speckle noise, "
+            "fragmented glyphs, or severe ink bleeding create erratic component sizes that disrupt OCR line analysis."
         ),
         "formula": (
-            "1. Binarise image (Otsu).\n"
-            "2. Find all connected components and their pixel areas "
-            "   (drop specks < 4 px).\n"
-            "3. CV = std(areas) / mean(areas)  (coefficient of variation).\n"
-            "4. Score = clamp(100 − CV × 40, 0, 100)."
+            "Typographic Component Variation Method:\n"
+            "1. Binarize image (Otsu) and identify connected components via cv2.connectedComponentsWithStats.\n"
+            "2. Filter out tiny dust specks (< 4 px area) and page background.\n"
+            "3. Compute area mean and standard deviation: CV = std(areas) / mean(areas).\n"
+            "4. Typographically calibrated curve (accounting for natural conjunct and matra size variations):\n"
+            "   Score = clamp(100.0 − max(0.0, CV − 0.35) × 45.0, 0, 100)."
         ),
         "ocr_impact": (
-            "High variance in component sizes (CV > 1.25) is strongly correlated "
-            "with broken or merged characters, which directly reduces OCR "
-            "accuracy through mis-segmentation."
+            "Natural printed Devanagari text exhibits CV values between 0.7 and 1.1 due to legitimate ligature variations. "
+            "Values exceeding 1.8 indicate severe pepper noise or shattered characters that cause false line breaks."
         ),
-        "ideal_range": "Score ≥ 70 (CV ≤ 0.75). Excellent: CV ≤ 0.5.",
+        "ideal_range": "Score ≥ 70 (CV ≤ 1.0). Excellent: Score ≥ 81 (CV ≤ 0.77).",
     },
 
     "skew_penalty_score": {
         "display_name": "Skew Penalty Score",
         "owner": "Tanusha",
         "definition": (
-            "Skew is the rotation angle of the text lines relative to the "
-            "horizontal axis, usually caused by a tilted scan or photo capture."
+            "Skew represents the rotational tilt angle of text baselines and headlines relative to the horizontal axis. "
+            "Evaluation uses the Hough Line Transform to detect actual linear text baseline orientations."
         ),
         "importance": (
-            "OCR engines assume text runs horizontally. Even a small skew angle "
-            "causes character baselines to drift, leading to incorrect line "
-            "segmentation and reading-order errors."
+            "OCR engines segment text assuming horizontal lines. Even small skew angles cause character baselines "
+            "to drift across lines, resulting in merged lines, chopped words, and jumbled reading order."
         ),
         "formula": (
-            "1. Binarise image (Otsu) and collect foreground pixel coordinates.\n"
-            "2. Compute cv2.minAreaRect over those points to get an angle.\n"
-            "3. Normalise to skew_deg ∈ [0°, 45°] (deviation from horizontal/vertical).\n"
-            "4. Score = clamp(100 − skew_deg × 6, 0, 100)."
+            "Progressive Hough Line Transform Method:\n"
+            "1. Compute Canny edge map of grayscale image.\n"
+            "2. Detect text line segments via Probabilistic Hough Lines: cv2.HoughLinesP(edges, threshold=40, minLineLength=25, maxLineGap=10).\n"
+            "3. Calculate segment angles θ = arctan2(Δy, Δx) and normalize to [-45°, 45°].\n"
+            "4. Determine median text line skew angle: skew_deg = |median(θ)|.\n"
+            "5. Compute penalty score: Score = clamp(100.0 − skew_deg × 6.0, 0, 100)."
         ),
         "ocr_impact": (
-            "Skew greater than ~5° measurably increases word error rate; beyond "
-            "15° most OCR engines fail to segment lines correctly without a "
-            "deskew preprocessing step."
+            "Angles exceeding 3° reduce Tesseract line segmentation reliability. Skew beyond 10° produces severe "
+            "character dropouts. When skew penalty score drops below 60, deskewing is strongly recommended prior to OCR."
         ),
-        "ideal_range": "Score ≥ 70 (skew ≤ 5°). Excellent: skew ≤ 1.7°.",
+        "ideal_range": "Score ≥ 70 (skew angle ≤ 5.0°). Excellent: Score ≥ 81 (skew angle ≤ 3.1°).",
     },
 }

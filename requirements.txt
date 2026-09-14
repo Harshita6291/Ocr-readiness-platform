@@ -9,3 +9,4 @@ requests
 scikit-image
 pytesseract
 streamlit-cropper
+scipy

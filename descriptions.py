@@ -125,27 +125,26 @@ def get_factor_description(factor_key: str, score: float) -> str:
 
         "stroke_width_score": {
             "excellent": (
-                "✅ Stroke width is in the optimal range (approximately 2-4 pixels at current "
-                "resolution). Characters have the ideal thickness — not too thin to break under "
-                "noise, and not too thick to cause character fills or merges. OCR models are "
-                "trained on text with this stroke profile and will perform optimally."
+                "✅ Stroke width is in the optimal range (approximately 10–12% of character height). "
+                "Characters have the ideal thickness — not too thin to break under noise, and not "
+                "too thick to cause character fills or merges. OCR models are trained on text with "
+                "this stroke profile and will perform optimally."
             ),
             "good": (
-                "🟡 Stroke width is slightly outside the ideal range but still acceptable. "
-                "Characters may be slightly thinner or thicker than optimal, but OCR should "
-                "still produce good results for most fonts and sizes."
+                "🟡 Stroke width is slightly outside the ideal range but still acceptable (around "
+                "8–9% or 13–15% of character height). Characters may be slightly thinner or thicker "
+                "than optimal, but OCR should still produce good results for most fonts."
             ),
             "average": (
                 "🟠 Stroke width is noticeably outside the optimal range. If strokes are too "
-                "thin (< 1.5 px), noise or compression can break characters apart. If too thick "
-                "(> 6 px), character interiors may fill in and nearby characters may merge. "
-                "Consider adjusting the scan DPI or font size to bring stroke width into range."
+                "thin (< 6% of character height), noise or compression can break characters apart. If too thick "
+                "(> 18% of character height), character loops ('e', 'a', 'o') may fill in and merge. "
+                "Consider adjusting the scan resolution or binarization threshold."
             ),
             "poor": (
-                "🔴 Stroke width is far outside the optimal range. Either the text is printed "
-                "very small at low resolution (resulting in < 1 px strokes) or very large/bold "
-                "at low resolution (resulting in filled characters). Both conditions severely "
-                "impact OCR segmentation. Adjust scan resolution or font size significantly."
+                "🔴 Stroke width is far outside the optimal range (< 4% or > 22% of character height). "
+                "Text strokes are either too faint and broken or heavily over-inked and blobbed together. "
+                "Both conditions severely impact OCR segmentation. Adjust scan resolution or capture quality."
             ),
         },
 

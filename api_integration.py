@@ -90,14 +90,28 @@ def _parse_vivek(data):
     stroke_result = density_result = None
     raw = _normalize(data.get("stroke_width"))
     if raw is not None:
-        stroke_result = {"factor_name":"stroke_width_score","score":round(raw,1),
-            "status":_classify(raw),"description":f"Stroke from Vivek API: {raw:.1f}",
-            "source":"vivek_api","raw_value":data.get("stroke_width"),"unit":""}
-    raw = _normalize(data.get("text_density"))
-    if raw is not None:
-        density_result = {"factor_name":"text_density_score","score":round(raw,1),
-            "status":_classify(raw),"description":f"Density from Vivek API: {raw:.1f}",
-            "source":"vivek_api","raw_value":data.get("text_density"),"unit":""}
+        stroke_result = {
+            "factor_name": "stroke_width_score",
+            "score": round(raw, 1),
+            "status": _classify(raw),
+            "description": f"Stroke from Vivek API: {raw:.1f}",
+            "source": "vivek_api",
+            "raw_value": data.get("stroke_raw_value", data.get("stroke_width")),
+            "unit": data.get("stroke_unit", "ratio"),
+            "details": data.get("stroke_details", {})
+        }
+    raw_td = _normalize(data.get("text_density"))
+    if raw_td is not None:
+        density_result = {
+            "factor_name": "text_density_score",
+            "score": round(raw_td, 1),
+            "status": _classify(raw_td),
+            "description": f"Density from Vivek API: {raw_td:.1f}",
+            "source": "vivek_api",
+            "raw_value": data.get("density_raw_value", data.get("text_density")),
+            "unit": data.get("density_unit", "% text coverage"),
+            "details": data.get("density_details", {})
+        }
     return stroke_result, density_result
 
 def _parse_tanusha(data):
@@ -153,10 +167,23 @@ def call_all_team_apis(img_bgr, local_results):
     data = _post_image(urls["vivek"], img_bgr)
     if data is not None:
         stroke_r, density_r = _parse_vivek(data)
-        if stroke_r:  merged["stroke_width_score"] = stroke_r;  status["stroke_width_score"] = "api ✅ Vivek"
-        else:         status["stroke_width_score"]  = "local ⚡ (Vivek returned unexpected format)"
-        if density_r: merged["text_density_score"]  = density_r; status["text_density_score"] = "api ✅ Vivek"
-        else:         status["text_density_score"]  = "local ⚡ (Vivek returned unexpected format)"
+        if stroke_r:
+            if (not stroke_r.get("details") or not stroke_r["details"].get("median_stroke_width_px")) and local_results.get("stroke_width_score", {}).get("details"):
+                stroke_r["details"] = local_results["stroke_width_score"]["details"]
+            if (stroke_r.get("raw_value") == stroke_r.get("score") or not stroke_r.get("raw_value")) and local_results.get("stroke_width_score", {}).get("raw_value") is not None:
+                stroke_r["raw_value"] = local_results["stroke_width_score"]["raw_value"]
+                stroke_r["unit"] = local_results["stroke_width_score"].get("unit", "ratio")
+            merged["stroke_width_score"] = stroke_r
+            status["stroke_width_score"] = "api ✅ Vivek"
+        else:
+            status["stroke_width_score"] = "local ⚡ (Vivek returned unexpected format)"
+        if density_r:
+            if not density_r.get("details") and local_results.get("text_density_score", {}).get("details"):
+                density_r["details"] = local_results["text_density_score"]["details"]
+            merged["text_density_score"]  = density_r
+            status["text_density_score"] = "api ✅ Vivek"
+        else:
+            status["text_density_score"]  = "local ⚡ (Vivek returned unexpected format)"
     else:
         status["stroke_width_score"] = "local ⚡ (Vivek API offline)"
         status["text_density_score"] = "local ⚡ (Vivek API offline)"

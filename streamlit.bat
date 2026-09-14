@@ -1,2 +1,6 @@
 @echo off
-"C:\Program Files\Python314\python.exe" -m streamlit %*
+if exist "%~dp0.venv\Scripts\python.exe" (
+    "%~dp0.venv\Scripts\python.exe" -m streamlit %*
+) else (
+    python -m streamlit %*
+)

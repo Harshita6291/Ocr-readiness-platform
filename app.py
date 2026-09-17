@@ -5,6 +5,9 @@ Run: streamlit run app.py
 """
 
 import sys, os
+import copy
+import hashlib
+import io
 sys.path.insert(0, os.path.dirname(__file__))
 
 import numpy as np
@@ -26,6 +29,18 @@ from overlay import (
     get_blur_overlay, get_noise_overlay, get_skew_overlay,
     get_text_density_overlay, get_stroke_width_overlay,
     get_connected_components_overlay
+)
+
+from refinement import (
+    FACTOR_KEYS as REFINEMENT_FACTOR_KEYS,
+    REFINEMENT_INFO,
+    RefinementCandidate,
+    assess_candidate,
+    bgr_to_rgb,
+    evaluate_factor_refinement,
+    refinement_eligibility,
+    refine_all,
+    run_all_factors as refinement_local_scorer,
 )
 
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
@@ -573,6 +588,135 @@ def make_radar(factor_results):
     )
     return fig
 
+# ── Refinement state and helpers ─────────────────────────────────────────────
+# Refinement never changes factor formulas. It only supplies a new active image
+# to the existing analysis pipeline and keeps every prior analysis reversible.
+_REFINEMENT_DEFAULTS = {
+    "refinement_source_signature": "",
+    "refinement_preview_open": False,
+    "refinement_preview_kind": "",
+    "refinement_candidate_img": None,
+    "refinement_candidate_results": {},
+    "refinement_candidate_api_status": {},
+    "refinement_baseline_img": None,
+    "refinement_baseline_results": {},
+    "refinement_factor": "",
+    "refinement_method": "",
+    "refinement_parameters": {},
+    "refinement_candidate_safety": "",
+    "refinement_candidate_evaluated": [],
+    "refinement_history": [],
+    "refinement_apply_count": 0,
+    "refinement_last_applied": False,
+    "refinement_info_factor": "",
+    "refinement_feedback": "",
+    "refinement_all_steps": [],
+    "refinement_request": "",
+}
+
+
+def _pil_signature(image):
+    """Cheap stable signature used to detect a genuinely new crop/source image."""
+    if image is None:
+        return ""
+    preview = image.convert("RGB").copy()
+    preview.thumbnail((128, 128))
+    payload = f"{image.size}:{preview.size}:".encode() + preview.tobytes()
+    return hashlib.sha1(payload).hexdigest()
+
+
+def _clear_refinement_preview():
+    st.session_state.refinement_preview_open = False
+    st.session_state.refinement_preview_kind = ""
+    st.session_state.refinement_candidate_img = None
+    st.session_state.refinement_candidate_results = {}
+    st.session_state.refinement_candidate_api_status = {}
+    st.session_state.refinement_baseline_img = None
+    st.session_state.refinement_baseline_results = {}
+    st.session_state.refinement_factor = ""
+    st.session_state.refinement_method = ""
+    st.session_state.refinement_parameters = {}
+    st.session_state.refinement_candidate_safety = ""
+    st.session_state.refinement_candidate_evaluated = []
+    st.session_state.refinement_all_steps = []
+
+
+def _reset_refinement_state():
+    for key, value in _REFINEMENT_DEFAULTS.items():
+        st.session_state[key] = copy.deepcopy(value)
+
+
+def _copy_analysis_snapshot():
+    image = st.session_state.get("analysis_img")
+    heatmap = st.session_state.get("ocr_heatmap_img")
+    return {
+        "analysis_img": image.copy() if image is not None else None,
+        "final_results": copy.deepcopy(st.session_state.get("final_results", {})),
+        "api_status": copy.deepcopy(st.session_state.get("api_status", {})),
+        "ocr_conf": st.session_state.get("ocr_conf"),
+        "ocr_text": st.session_state.get("ocr_text", ""),
+        "ocr_word_details": copy.deepcopy(st.session_state.get("ocr_word_details", [])),
+        "ocr_heatmap_img": heatmap.copy() if heatmap is not None else None,
+        "ocr_lang_stats": copy.deepcopy(st.session_state.get("ocr_lang_stats", {})),
+        "recs": copy.deepcopy(st.session_state.get("recs", [])),
+    }
+
+
+def _restore_analysis_snapshot(snapshot):
+    for key, value in snapshot.items():
+        st.session_state[key] = value
+    st.session_state.analysis_done = bool(snapshot.get("final_results"))
+
+
+def _score_image_with_existing_pipeline(image, use_apis):
+    """The normal app scoring path, retained for applied refinements too."""
+    bgr = pil_to_bgr(image)
+    local_results = run_all_factors(bgr)
+    if use_apis:
+        return call_all_team_apis(bgr, local_results)
+    return local_results, {}
+
+
+def _complete_analysis_for_active_image(image, use_apis):
+    """Run the same scorer, API option, Tesseract, and recommendation flow as Analyse Image."""
+    final_results, api_status = _score_image_with_existing_pipeline(image, use_apis)
+    recs = generate_recommendations(final_results)
+    ocr_conf, ocr_text, word_details, heatmap_img, lang_stats = run_tesseract(image)
+    return final_results, api_status, recs, ocr_conf, ocr_text, word_details, heatmap_img, lang_stats
+
+
+def _store_refinement_preview(candidate, baseline_image, baseline_results, api_status, kind="single", all_steps=None):
+    candidate_rgb = bgr_to_rgb(candidate.image)
+    st.session_state.refinement_preview_open = True
+    st.session_state.refinement_preview_kind = kind
+    st.session_state.refinement_candidate_img = Image.fromarray(candidate_rgb)
+    st.session_state.refinement_candidate_results = copy.deepcopy(candidate.scores or {})
+    st.session_state.refinement_candidate_api_status = copy.deepcopy(api_status)
+    st.session_state.refinement_baseline_img = baseline_image.copy()
+    st.session_state.refinement_baseline_results = copy.deepcopy(baseline_results)
+    st.session_state.refinement_factor = candidate.target_factor
+    st.session_state.refinement_method = candidate.method
+    st.session_state.refinement_parameters = copy.deepcopy(candidate.parameters)
+    st.session_state.refinement_candidate_safety = candidate.safety_reason
+    st.session_state.refinement_all_steps = copy.deepcopy(all_steps or [])
+
+
+def _factor_info_markdown(key):
+    existing = FACTOR_INFO.get(key, {})
+    method = REFINEMENT_INFO.get(key, {})
+    formula = existing.get("formula", "See the existing factor implementation.")
+    definition = existing.get("definition", "This OCR quality factor is evaluated by the existing scorer.")
+    impact = existing.get("ocr_impact", "It affects OCR reliability.")
+    return (
+        f"**Measures:** {definition}\n\n"
+        f"**Existing scoring method:** `{formula}`\n\n"
+        f"**Why it matters:** {impact}\n\n"
+        f"**Refinement approach:** {method.get('details', 'A conservative image-only candidate search.')}\n\n"
+        "**Safety limit:** a candidate is shown only when its target improves by at least "
+        "+0.5, no other factor falls by more than 5 points, and OCR Readiness strictly improves."
+    )
+
+
 # ── Session state init ────────────────────────────────────────────────────────
 # This keeps the image and results alive when user switches pages
 if "analysis_done"    not in st.session_state: st.session_state.analysis_done    = False
@@ -590,6 +734,10 @@ if "recs"             not in st.session_state: st.session_state.recs            
 if "card_info_open"   not in st.session_state: st.session_state.card_info_open   = {}
 
 # ── Sidebar ───────────────────────────────────────────────────────────────────
+for _refinement_key, _refinement_value in _REFINEMENT_DEFAULTS.items():
+    if _refinement_key not in st.session_state:
+        st.session_state[_refinement_key] = copy.deepcopy(_refinement_value)
+
 with st.sidebar:
     st.markdown("## 🔍 OCR Readiness")
     st.markdown("**SNLP Department**")
@@ -631,6 +779,7 @@ with st.sidebar:
                         "image_name","raw_pil","analysis_img","recs"]:
                 st.session_state[key] = False if key=="analysis_done" else ({} if ("results" in key or "status" in key or "lang" in key) else (None if key in ["ocr_conf","raw_pil","analysis_img","ocr_heatmap_img"] else ([] if (key=="recs" or "word" in key) else "")))
             st.rerun()
+            _reset_refinement_state()
 
 
 # ════════════════════════════════════════════════
@@ -783,6 +932,7 @@ if "🏠 Analyse Image" in nav:
                 st.session_state.ocr_heatmap_img  = None
                 st.session_state.ocr_lang_stats   = {}
                 st.session_state.analysis_img      = raw_pil
+                _reset_refinement_state()
     elif st.session_state.raw_pil is None:
         st.info("👆 Upload document image(s) to begin the analysis.")
         st.stop()
@@ -794,6 +944,7 @@ if "🏠 Analyse Image" in nav:
     st.markdown("### Step 1 — Select Region")
     use_crop = st.checkbox("✂️ Crop the image before analysis")
 
+    selected_source_img = raw_pil
     if use_crop:
         if CROPPER_OK:
             st.markdown("**Drag the handles to select the region you want to analyse:**")
@@ -810,7 +961,7 @@ if "🏠 Analyse Image" in nav:
                 w, h = cropped.size
                 st.metric("Width", f"{w} px")
                 st.metric("Height", f"{h} px")
-            st.session_state.analysis_img = cropped
+            selected_source_img = cropped
         else:
             st.warning("streamlit-cropper not installed. Using slider crop instead.")
             c1, c2 = st.columns(2)
@@ -826,12 +977,28 @@ if "🏠 Analyse Image" in nav:
                 if bottom <= top:   bottom = top   + 1
                 cropped = raw_pil.crop((left, top, right, bottom))
                 st.image(cropped, caption="Cropped Region", width="stretch")
-            st.session_state.analysis_img = cropped
+            selected_source_img = cropped
     else:
         st.image(raw_pil, caption="Full image — will be analysed", width="stretch")
-        st.session_state.analysis_img = raw_pil
+        selected_source_img = raw_pil
 
     analysis_img = st.session_state.analysis_img
+    source_signature = f"{'crop' if use_crop else 'full'}:{_pil_signature(selected_source_img)}"
+    if source_signature != st.session_state.refinement_source_signature:
+        # A new crop/source invalidates results and any refinements based on the old pixels.
+        _reset_refinement_state()
+        st.session_state.refinement_source_signature = source_signature
+        st.session_state.analysis_img = selected_source_img.copy()
+        st.session_state.analysis_done = False
+        st.session_state.final_results = {}
+        st.session_state.api_status = {}
+        st.session_state.ocr_conf = None
+        st.session_state.ocr_text = ""
+        st.session_state.ocr_word_details = []
+        st.session_state.ocr_heatmap_img = None
+        st.session_state.ocr_lang_stats = {}
+        st.session_state.recs = []
+
 
     # ── Step 2: Analyse ──────────────────────────
     st.markdown("### Step 2 — Run Analysis")
@@ -956,6 +1123,35 @@ if "🏠 Analyse Image" in nav:
         # ── 10 factor cards ─────────────────────
         st.markdown("#### Factor Scores")
         cols = st.columns(4)
+        refine_action_col, refine_status_col, refine_revert_col = st.columns([1.2, 2.4, 1.0])
+        with refine_action_col:
+            if st.button("✨ Refine All", key="refinement_refine_all", width="stretch"):
+                st.session_state.refinement_request = "__all__"
+                st.session_state.refinement_feedback = ""
+        with refine_status_col:
+            st.caption("Refinement changes only image pixels. Every candidate is rescored by the existing 10-factor pipeline and must improve OCR Readiness.")
+        with refine_revert_col:
+            if st.session_state.refinement_history and st.button("↩ Revert", key="refinement_revert", width="stretch"):
+                snapshot = st.session_state.refinement_history.pop()
+                _restore_analysis_snapshot(snapshot)
+                st.session_state.refinement_last_applied = bool(st.session_state.refinement_history)
+                _clear_refinement_preview()
+                st.session_state.refinement_feedback = "Reverted to the immediately previous active image and analysis."
+                st.rerun()
+
+        if st.session_state.refinement_last_applied and st.session_state.analysis_img is not None:
+            img_buffer = io.BytesIO()
+            st.session_state.analysis_img.save(img_buffer, format="PNG", optimize=True)
+            st.download_button(
+                "⬇️ Download Refined Image",
+                data=img_buffer.getvalue(),
+                file_name=f"refined_{image_name.rsplit('.', 1)[0]}.png",
+                mime="image/png",
+                key="refinement_download",
+            )
+        if st.session_state.refinement_feedback:
+            st.info(st.session_state.refinement_feedback)
+
         for i, (key, display) in enumerate(DISPLAY_NAMES.items()):
             r    = final_results.get(key, {})
             sc   = r.get("score", 0)
@@ -1016,7 +1212,118 @@ if "🏠 Analyse Image" in nav:
                   <label class="toggle-arrow" for="{chk_id}">∨</label>
                 </div>""", unsafe_allow_html=True)
 
+                info_col, refine_col = st.columns(2)
+                with info_col:
+                    if st.button("ⓘ Info", key=f"refinement_info_{key}", width="stretch"):
+                        st.session_state.refinement_info_factor = key
+                eligibility, _eligibility_message = refinement_eligibility(float(sc))
+                with refine_col:
+                    if eligibility == "eligible":
+                        if st.button("✨ Refine", key=f"refinement_refine_{key}", width="stretch"):
+                            st.session_state.refinement_request = key
+                            st.session_state.refinement_feedback = ""
+                    elif eligibility == "severe":
+                        st.caption("⚠️ Auto-refinement disabled — recapture/rescan required.")
+                    else:
+                        st.caption("✓ No refinement needed")
+
         st.markdown("<br>", unsafe_allow_html=True)
+
+        info_factor = st.session_state.refinement_info_factor
+        if info_factor in DISPLAY_NAMES:
+            with st.expander(f"ⓘ {DISPLAY_NAMES[info_factor]} — scoring and refinement information", expanded=True):
+                st.markdown(_factor_info_markdown(info_factor))
+                if st.button("Close info", key="refinement_close_info"):
+                    st.session_state.refinement_info_factor = ""
+                    st.rerun()
+
+        refinement_request = st.session_state.get("refinement_request", "")
+        if refinement_request:
+            st.session_state.refinement_request = ""
+            baseline_image = analysis_img.copy()
+            baseline_results = copy.deepcopy(final_results)
+            baseline_bgr = pil_to_bgr(baseline_image)
+
+            if refinement_request == "__all__":
+                with st.spinner("✨ Safely evaluating eligible factors one at a time…"):
+                    local_baseline = refinement_local_scorer(baseline_bgr)
+                    all_outcome = refine_all(baseline_bgr, local_baseline, refinement_local_scorer)
+
+                if not all_outcome.steps:
+                    st.session_state.refinement_feedback = all_outcome.message
+                else:
+                    all_candidate = RefinementCandidate(
+                        all_outcome.final_image,
+                        "refine_all",
+                        "Safe sequential Refine All",
+                        {"steps": len(all_outcome.steps)},
+                    )
+                    with st.spinner("Verifying the final Refine All image through the active analysis pipeline…"):
+                        final_candidate_scores, final_candidate_api = _score_image_with_existing_pipeline(
+                            Image.fromarray(bgr_to_rgb(all_candidate.image)), use_apis
+                        )
+                    all_candidate.scores = final_candidate_scores
+                    all_candidate.readiness_improvement = round(
+                        float(final_candidate_scores["ocr_readiness_score"]) - float(baseline_results["ocr_readiness_score"]), 1
+                    )
+                    all_candidate.non_target_changes = {
+                        factor: round(
+                            float(final_candidate_scores[factor]["score"]) - float(baseline_results[factor]["score"]), 1
+                        ) for factor in REFINEMENT_FACTOR_KEYS
+                    }
+                    all_candidate.safe = (
+                        all_candidate.readiness_improvement > 0.0
+                        and all(delta >= -5.0 for delta in all_candidate.non_target_changes.values())
+                    )
+                    all_candidate.safety_reason = (
+                        "Passed the final Refine All OCR Readiness and all-factor safety checks."
+                        if all_candidate.safe else "No safe refinement was found for this factor set."
+                    )
+                    if all_candidate.safe:
+                        all_steps = [
+                            {"factor": DISPLAY_NAMES[step.target_factor], "method": step.method,
+                             "ocr_readiness_change": step.readiness_improvement}
+                            for step in all_outcome.steps
+                        ]
+                        _store_refinement_preview(
+                            all_candidate, baseline_image, baseline_results, final_candidate_api,
+                            kind="all", all_steps=all_steps,
+                        )
+                    else:
+                        st.session_state.refinement_feedback = "No safe refinement was found for the eligible factors."
+
+            elif refinement_request in DISPLAY_NAMES:
+                shown_score = float(baseline_results.get(refinement_request, {}).get("score", 0.0))
+                eligibility, eligibility_message = refinement_eligibility(shown_score)
+                if eligibility == "severe":
+                    st.session_state.refinement_feedback = eligibility_message
+                elif eligibility == "good":
+                    st.session_state.refinement_feedback = eligibility_message
+                else:
+                    with st.spinner(f"✨ Generating and scoring {DISPLAY_NAMES[refinement_request]} candidates…"):
+                        # Every candidate is measured by the unmodified local 10-factor scorer.
+                        # The chosen local candidate is then verified through the currently active
+                        # app pipeline (including optional team APIs) before it can be previewed.
+                        local_baseline = refinement_local_scorer(baseline_bgr)
+                        outcome = evaluate_factor_refinement(
+                            baseline_bgr, refinement_request, local_baseline, refinement_local_scorer
+                        )
+                    candidate = outcome.best_candidate
+                    if candidate is None:
+                        st.session_state.refinement_feedback = outcome.message
+                    else:
+                        with st.spinner("Verifying the selected candidate through the active analysis pipeline…"):
+                            final_candidate_scores, final_candidate_api = _score_image_with_existing_pipeline(
+                                Image.fromarray(bgr_to_rgb(candidate.image)), use_apis
+                            )
+                        assess_candidate(candidate, baseline_results, final_candidate_scores)
+                        if candidate.safe:
+                            _store_refinement_preview(
+                                candidate, baseline_image, baseline_results, final_candidate_api
+                            )
+                            st.session_state.refinement_candidate_evaluated = outcome.evaluated
+                        else:
+                            st.session_state.refinement_feedback = "No safe refinement was found for this factor."
 
         # ── Tabs ─────────────────────────────────
         tab1, tab2, tab3, tab4 = st.tabs([

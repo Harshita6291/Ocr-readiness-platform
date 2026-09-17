@@ -303,7 +303,7 @@ def stroke_width_score(img_bgr: np.ndarray) -> Dict[str, Any]:
       1. Distance transform on Otsu binarized text (stroke radius via skeleton).   
       2. Connected components to estimate median character height (H_char).   
       3. Stroke-to-character-height ratio: R = W_stroke / H_char.   
-       8
+       
     OCR Typographic Calibration:   
       - Ideal R is ~0.10 to 0.12 (stroke width ~11% of character height).   
       - R < 0.05: Stroke too thin / broken characters (under-inking/erosion).   

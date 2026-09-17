@@ -35,6 +35,13 @@ def ensure_venv():
         print(f"[i] Creating virtual environment at {VENV_DIR}...")
         subprocess.check_call([sys.executable, "-m", "venv", VENV_DIR])
         print("[✓] Virtual environment created.")
+        
+    try:
+        subprocess.check_call([venv_py, "-c", "print(1)"], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    except Exception:
+        print("[!] Virtual environment Python is blocked by policy or broken. Falling back to system Python.")
+        return sys.executable
+        
     return venv_py
 
 def ensure_dependencies(venv_py):

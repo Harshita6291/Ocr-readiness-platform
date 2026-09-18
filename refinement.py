@@ -516,19 +516,26 @@ def refine_all(
     current_scores = initial_scores
     steps: List[RefinementCandidate] = []
     attempted: set[str] = set()
+    blur_passes = 0
+    max_blur_passes = 3
 
-    # Each factor is considered once per run.  A failed factor is not retried on
-    # a later image because that would multiply expensive complete rescoring.
-    while len(attempted) < len(FACTOR_KEYS):
+    # Most factors are considered once. Blur is allowed a few bounded passes so
+    # repeated edge definition can recover clarity without unlimited sharpening.
+    while len(attempted) < len(FACTOR_KEYS) or blur_passes < max_blur_passes:
         eligible = [
             key for key in FACTOR_KEYS
-            if key not in attempted and 20.0 <= float(current_scores.get(key, {}).get("score", 0.0)) < 80.0
+            if (
+                20.0 <= float(current_scores.get(key, {}).get("score", 0.0)) < 80.0
+                and (key not in attempted or (key == "blur_score" and blur_passes < max_blur_passes))
+            )
         ]
         if not eligible:
             break
-        eligible.sort(key=lambda key: float(current_scores[key]["score"]))
+        eligible.sort(key=lambda key: (key != "blur_score", float(current_scores[key]["score"])))
         target = eligible[0]
         attempted.add(target)
+        if target == "blur_score":
+            blur_passes += 1
         outcome = evaluate_factor_refinement(current_image, target, current_scores, scorer)
         candidate = outcome.best_candidate
         if candidate is None or candidate.scores is None:

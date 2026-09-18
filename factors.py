@@ -42,23 +42,80 @@ def _clamp(v: float, lo=0.0, hi=100.0) -> float:
 # YASH — Noise Score (OCR Calibrated)
 # ──────────────────────────────────────────────
 
+def _noise_text_background_mask(gray_u8: np.ndarray) -> np.ndarray:
+    """
+    Boolean mask of BACKGROUND (non-ink) pixels, for noise measurement only.
+
+    Uses Otsu binarization (ink vs. paper) instead of Canny. Canny fires on
+    isolated noise pixels just as readily as on stroke edges, so under
+    impulse/salt-and-pepper noise its dilated exclusion mask can swallow
+    95%+ of the image -- leaving a measurement made on the quietest handful
+    of surviving pixels rather than the actual background. Otsu targets the
+    ink/paper bimodal split directly, so it stays stable under that noise.
+    """
+    h, w = gray_u8.shape
+    diag = (h ** 2 + w ** 2) ** 0.5
+
+    den = cv2.medianBlur(gray_u8, 3)  # only to locate ink; not used for measurement
+    _, ink = cv2.threshold(den, 0, 255, cv2.THRESH_BINARY_INV + cv2.THRESH_OTSU)
+
+    k = max(3, int(round(diag * 0.006)) | 1)  # scale-adaptive, odd kernel size
+    kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (k, k))
+    ink = cv2.morphologyEx(ink, cv2.MORPH_CLOSE, kernel)
+    ink_dilated = cv2.dilate(ink, kernel)
+    flat = ink_dilated == 0
+
+    frac_bg = flat.mean()
+    ink_mean = gray_u8[ink > 0].mean() if (ink > 0).any() else 0
+    bg_mean = gray_u8[~(ink_dilated > 0)].mean() if (~(ink_dilated > 0)).any() else 255
+    separated = abs(bg_mean - ink_mean) > 15
+
+    if frac_bg < 0.05 or frac_bg > 0.98 or not separated:
+        # Otsu failed to find a stable ink/paper split (near-blank or very
+        # dense image) -- fall back to the brightest 40% of pixels as a
+        # background proxy rather than trusting a broken segmentation.
+        flat = gray_u8 >= np.percentile(gray_u8, 60)
+    return flat
+
+
+def _noise_robust_sigma(residual: np.ndarray) -> float:
+    """MAD-based robust std -- resistant to leftover impulse spikes that
+    would dominate a plain np.std."""
+    if residual.size == 0:
+        return 0.0
+    med = np.median(residual)
+    mad = np.median(np.abs(residual - med))
+    return float(1.4826 * mad)
+
+
 def noise_score(img_bgr: np.ndarray) -> Dict[str, Any]:
     """
-    Estimates image noise using the high-frequency residual method,
-    but ONLY measures it in flat/background regions — areas with no
-    nearby text edges. This prevents dense, sharp text (which has
-    naturally high edge-residual variance) from being misread as noise.
+    Estimates image noise via two SEPARATE components -- impulse
+    (salt-and-pepper) density and continuous (Gaussian/sensor/JPEG-type)
+    grain -- rather than a single blended residual std. A single Gaussian-
+    residual std cannot represent both regimes: heavy impulse noise
+    corrupts a plain std estimate, and it corrupts it more, not less, the
+    harder an edge-based mask tries to exclude "busy" areas (see
+    _noise_text_background_mask). Measuring them separately and combining
+    afterward keeps the score responsive to whichever noise type is
+    actually present.
 
     Method:
-      1. Detect edges (text strokes) via Canny.
-      2. Dilate the edge mask to exclude a margin around every stroke.
-      3. Compute Gaussian-blur residual, but only sample pixels in the
-         remaining "flat" background area.
-      4. std(residual in flat area) = true noise estimate.
+      1. Separate background from ink using Otsu, not Canny (stable under
+         impulse noise -- see _noise_text_background_mask).
+      2. impulse_frac: fraction of background pixels that differ sharply
+         from their local median (adaptive threshold, robust to the
+         image's own contrast).
+      3. gaussian_sigma: robust (MAD-based) sigma of the Gaussian-blur
+         residual on background pixels, excluding pixels already flagged
+         as impulse spikes so they don't inflate the estimate.
+      4. noise_index = gaussian_sigma + 140 * impulse_frac (impulse
+         density expressed as an equivalent-sigma contribution).
 
-    Score = clamp(100 − noise_std / 0.30, 0, 100)
-    Calibration: clean scans have flat-region noise_std ~0-8;
-    heavy scan/sensor noise pushes it to 15-30+.
+    Score = clamp(100 * exp(-(noise_index / 22) ** 1.05), 2, 98).
+    Calibration: clean images -> noise_index ~0-2 -> 95+;
+    moderate noise -> ~10-15 -> 55-75; heavy noise (Gaussian or impulse or
+    both) -> ~25-40+ -> under 30.
     """
     if img_bgr is None or img_bgr.size == 0:
         return {
@@ -74,39 +131,45 @@ def noise_score(img_bgr: np.ndarray) -> Dict[str, Any]:
         gray = cv2.cvtColor(img_bgr, cv2.COLOR_BGR2GRAY).astype(np.float32)
     else:
         gray = img_bgr.astype(np.float32)
+    gray_u8 = np.clip(gray, 0, 255).astype(np.uint8)
 
-    # Exclude text-edge regions so they aren't counted as "noise"
-    edges = cv2.Canny(gray.astype(np.uint8), 50, 150)
-    edges_dilated = cv2.dilate(edges, np.ones((7, 7), np.uint8))
-    flat_mask = edges_dilated == 0
+    flat_mask = _noise_text_background_mask(gray_u8)
+    bg_count = int(flat_mask.sum())
+
+    med3 = cv2.medianBlur(gray_u8, 3).astype(np.float32)
+    diff = np.abs(gray - med3)
+    diff_bg = diff[flat_mask] if bg_count >= 200 else diff.ravel()
+
+    base_mad = _noise_robust_sigma(diff_bg)
+    impulse_threshold = max(20.0, 6.0 * max(base_mad, 1e-3))
+    impulse_frac = float(np.mean(diff_bg > impulse_threshold))
 
     blurred = cv2.GaussianBlur(gray, (5, 5), 0)
     residual = gray - blurred
+    residual_bg = residual[flat_mask] if bg_count >= 200 else residual.ravel()
+    diff_bg_full = diff[flat_mask] if bg_count >= 200 else diff.ravel()
+    clean_bg_residual = residual_bg[diff_bg_full <= impulse_threshold]
+    gaussian_sigma = _noise_robust_sigma(
+        clean_bg_residual if clean_bg_residual.size >= 50 else residual_bg
+    )
 
-    flat_residual = residual[flat_mask]
-    if flat_residual.size < 50:
-        # Fallback for images that are almost entirely text/edges
-        noise_std = float(np.std(residual))
-    else:
-        noise_std = float(np.std(flat_residual))
-
-    # Realistic continuous asymptotic curve:
-    # Clean background (σ ~0-2) -> 93-96
-    # Moderate noise (σ ~8-15) -> 60-75
-    # Heavy noise (σ ~30-50) -> 18-30 (never flat 0.0)
-    score = 16.0 + 80.0 * float(np.exp(-(noise_std / 16.0) ** 1.1))
-    score = _clamp(score, lo=14.0, hi=96.0)
+    noise_index = gaussian_sigma + 140.0 * impulse_frac
+    score = 100.0 * float(np.exp(-(noise_index / 22.0) ** 1.05))
+    score = _clamp(score, lo=2.0, hi=98.0)
 
     return {
         "factor_name": "noise_score",
         "score": round(score, 1),
         "status": _classify(score),
-        "description": f"Estimated background noise σ = {noise_std:.2f}. "
+        "description": f"Estimated background noise σ = {noise_index:.2f} "
+                       f"(continuous grain σ={gaussian_sigma:.2f}, impulse spikes={impulse_frac * 100:.1f}%). "
                        + ("Low noise — good OCR candidate." if score >= 70
                           else "Moderate noise detected." if score >= 45
                           else "High noise — apply denoising filter."),
-        "raw_value": round(noise_std, 3),
-        "unit": "σ (std of residual, flat regions only)",
+        "raw_value": round(noise_index, 3),
+        "unit": "σ (composite noise index, background regions only)",
+        "gaussian_sigma": round(gaussian_sigma, 3),
+        "impulse_frac": round(impulse_frac, 4),
     }
 
 

@@ -25,11 +25,7 @@ from descriptions import get_factor_description
 from short_descriptions import get_short_description
 from api_integration import call_all_team_apis, KNOWN_ISSUES, get_current_urls
 from config_manager import load_config, save_config, build_urls, PORTS, ENDPOINTS
-from overlay import (
-    get_blur_overlay, get_noise_overlay, get_skew_overlay,
-    get_text_density_overlay, get_stroke_width_overlay,
-    get_connected_components_overlay
-)
+
 
 from refinement import (
     FACTOR_KEYS as REFINEMENT_FACTOR_KEYS,
@@ -419,50 +415,7 @@ def generate_ocr_error_heatmap(bgr_img: np.ndarray, word_details: list) -> np.nd
 
     return img_out
 
-def render_copy_to_clipboard_button(text_to_copy: str, button_id: str = "copy_btn"):
-    """
-    Renders an interactive JS Copy to Clipboard button for Streamlit.
-    """
-    import html
-    escaped_text = html.escape(text_to_copy).replace("\n", "\\n").replace("'", "\\'").replace('"', '&quot;')
 
-    html_code = f"""
-    <div style="margin-bottom: 12px;">
-      <button id="{button_id}" onclick="copyText()" style="
-        background: linear-gradient(135deg, #00C4B4 0%, #0F3460 100%);
-        color: white;
-        border: none;
-        padding: 9px 18px;
-        border-radius: 8px;
-        font-weight: 600;
-        font-size: 13px;
-        cursor: pointer;
-        display: inline-flex;
-        align-items: center;
-        gap: 6px;
-        box-shadow: 0 2px 6px rgba(0,0,0,0.15);
-        transition: transform 0.1s ease;
-      ">
-        📋 Copy Extracted Text to Clipboard
-      </button>
-      <span id="{button_id}_status" style="margin-left: 12px; font-size: 13px; color: #10B981; font-weight: 600; display: none;">
-        ✓ Copied to clipboard!
-      </span>
-    </div>
-    <script>
-    function copyText() {{
-      const text = `{escaped_text}`;
-      navigator.clipboard.writeText(text).then(function() {{
-        const status = document.getElementById('{button_id}_status');
-        status.style.display = 'inline';
-        setTimeout(() => {{ status.style.display = 'none'; }}, 2500);
-      }}).catch(function(err) {{
-        console.error('Failed to copy: ', err);
-      }});
-    }}
-    </script>
-    """
-    st.components.v1.html(html_code, height=45)
 
 def run_tesseract(img):
     empty_stats = detect_language_stats("")
@@ -1154,15 +1107,8 @@ if "🏠 Analyse Image" in nav:
         # ── 10 factor cards ─────────────────────
         st.markdown("#### Factor Scores")
         cols = st.columns(4)
-        refine_action_col, refine_status_col, refine_revert_col = st.columns([1.2, 2.4, 1.0])
-        with refine_action_col:
-            if st.button("✨ Refine All", key="refinement_refine_all", width="stretch"):
-                st.session_state.refinement_request = "__all__"
-                st.session_state.refinement_feedback = ""
-        with refine_status_col:
-            st.caption("Refinement changes only image pixels. Every candidate is rescored by the existing 10-factor pipeline and must improve OCR Readiness.")
-        with refine_revert_col:
-            if st.session_state.refinement_history and st.button("↩ Revert", key="refinement_revert", width="stretch"):
+        if st.session_state.refinement_history:
+            if st.button("↩ Revert", key="refinement_revert"):
                 snapshot = st.session_state.refinement_history.pop()
                 _restore_analysis_snapshot(snapshot)
                 st.session_state.refinement_last_applied = bool(st.session_state.refinement_history)
@@ -1445,11 +1391,10 @@ if "🏠 Analyse Image" in nav:
                     st.rerun()
 
         # ── Tabs ─────────────────────────────────
-        tab1, tab2, tab3, tab4 = st.tabs([
+        tab1, tab2, tab3 = st.tabs([
             "🔬 Factor Details",
             "📝 Extracted Text Quality",
             "💡 Recommendations",
-            "🔍 Visual Overlays",
         ])
 
         with tab1:
@@ -1491,24 +1436,8 @@ if "🏠 Analyse Image" in nav:
                         st.markdown(f"<div style='text-align:center;font-size:12px;color:#6B7280;'>out of 100</div>", unsafe_allow_html=True)
 
         with tab2:
-            st.markdown("### 📝 Extracted Text Quality Comparison")
             if ocr_conf is not None:
-                lang_stats = st.session_state.get("ocr_lang_stats", detect_language_stats(ocr_text))
                 word_details = st.session_state.get("ocr_word_details", [])
-                heatmap_img = st.session_state.get("ocr_heatmap_img", None)
-
-                # ── Top Metrics Bar ──
-                mcol1, mcol2, mcol3 = st.columns(3)
-                with mcol1:
-                    st.metric("Tesseract Mean Confidence", f"{ocr_conf}%")
-                with mcol2:
-                    st.metric("Detected Language", lang_stats.get("detected_lang", "Unknown"))
-                with mcol3:
-                    h_p = lang_stats.get("hindi_pct", 0.0)
-                    e_p = lang_stats.get("english_pct", 0.0)
-                    st.metric("Language Breakdown", f"🇮🇳 {h_p}% Hin  |  🇬🇧 {e_p}% Eng")
-
-                st.markdown("---")
 
                 # ── Side-by-Side View ──
                 col_left, col_right = st.columns([1, 1])
@@ -1520,12 +1449,9 @@ if "🏠 Analyse Image" in nav:
                 with col_right:
                     st.markdown("#### 🔤 Extracted Text & Quality Analysis")
 
-                    if ocr_text and ocr_text.strip():
-                        render_copy_to_clipboard_button(ocr_text, "copy_btn_main")
-
                     view_mode = st.radio(
                         "Extracted Text Display Mode",
-                        ["🎨 Word Confidence Highlighting", "🗺️ Character Error Heatmap", "📄 Plain Text"],
+                        ["🎨 Word Confidence Highlighting", "📄 Plain Text"],
                         horizontal=True,
                     )
 
@@ -1541,14 +1467,6 @@ if "🏠 Analyse Image" in nav:
                         w_html = generate_word_confidence_html(word_details)
                         st.markdown(w_html, unsafe_allow_html=True)
                         st.caption("💡 Hover over any word tag to see its exact Tesseract confidence percentage.")
-
-                    elif "Character Error Heatmap" in view_mode:
-                        if heatmap_img is not None:
-                            heatmap_rgb = cv2.cvtColor(heatmap_img, cv2.COLOR_BGR2RGB)
-                            st.image(heatmap_rgb, caption="OCR Bounding Boxes & Low-Confidence Error Heatmap", use_container_width=True)
-                            st.caption("🔴 **Red Boxes/Heat**: Low confidence words (<50%) | 🟡 **Yellow**: Medium confidence (50-79%) | 🟢 **Green**: High confidence (≥80%)")
-                        else:
-                            st.info("No heatmap data available.")
 
                     elif "Plain Text" in view_mode:
                         if ocr_text and ocr_text.strip():
@@ -1571,55 +1489,6 @@ if "🏠 Analyse Image" in nav:
                 clean = rec.replace("**","<b>",1).replace("**","</b>",1)
                 st.markdown(f'<div class="{box_cls}">{clean}</div>',
                             unsafe_allow_html=True)
-
-        with tab4:
-            st.markdown("### 🔍 Explainable Visual Overlays")
-            st.caption("Visualize exactly where problems are detected on your document image:")
-
-            overlay_choice = st.selectbox(
-                "Select Factor Visual Overlay",
-                [
-                    "Blur Heatmap (Sharp vs Blurry regions)",
-                    "Noise Map (High background noise patches)",
-                    "Skew Angle Vector (Detected text baseline skew)",
-                    "Text Density (Paragraph bounding boxes)",
-                    "Stroke Width Map (Color coded stroke thickness)",
-                    "Connected Components (Glyph bounding boxes)",
-                    "OCR Error Heatmap (Tesseract Confidence Bounding Map)",
-                ]
-            )
-
-            bgr_curr = pil_to_bgr(analysis_img)
-
-            if "Blur Heatmap" in overlay_choice:
-                overlay_bgr = get_blur_overlay(bgr_curr)
-                st.info("🔴 **Red/Yellow**: Sharp crisp edges | 🔵 **Blue/Cyan**: Blurry or low-contrast regions")
-            elif "Noise Map" in overlay_choice:
-                overlay_bgr = get_noise_overlay(bgr_curr)
-                st.info("🔥 **Hot Patches (Yellow/Red)**: Background speckles and high noise variance patches")
-            elif "Skew Angle" in overlay_choice:
-                overlay_bgr = get_skew_overlay(bgr_curr)
-                st.info("📐 **Cyan Horizontal Baseline** vs **Vector Line (Green = Aligned <3°, Red = Skewed >3°)**")
-            elif "Text Density" in overlay_choice:
-                overlay_bgr = get_text_density_overlay(bgr_curr)
-                st.info("🟩 **Teal Rectangles**: Detected paragraph blocks and text regions")
-            elif "Stroke Width" in overlay_choice:
-                overlay_bgr = get_stroke_width_overlay(bgr_curr)
-                st.info("🟢 **Green**: Ideal stroke width (1.5-4.5px) | 🔴 **Red**: Thin stroke (<1.5px) | 🟠 **Orange**: Thick stroke (>4.5px)")
-            elif "Connected Components" in overlay_choice:
-                overlay_bgr = get_connected_components_overlay(bgr_curr)
-                st.info("🎨 **Multi-colored Bounding Boxes**: Individual connected glyph components detected")
-            elif "OCR Error Heatmap" in overlay_choice:
-                heatmap_img = st.session_state.get("ocr_heatmap_img", None)
-                if heatmap_img is not None:
-                    overlay_bgr = heatmap_img
-                    st.info("🔴 **Red Boxes/Heat**: Low confidence words (<50%) | 🟡 **Yellow**: Medium confidence (50-79%) | 🟢 **Green**: High confidence (≥80%)")
-                else:
-                    overlay_bgr = get_blur_overlay(bgr_curr)
-                    st.info("No OCR heatmap data available yet. Displaying blur heatmap instead.")
-
-            overlay_rgb = cv2.cvtColor(overlay_bgr, cv2.COLOR_BGR2RGB)
-            st.image(overlay_rgb, caption=overlay_choice, use_container_width=True)
 
         # ── PDF Export ───────────────────────────
         st.markdown("---")

@@ -307,6 +307,69 @@ def _resolution_candidates(image: np.ndarray, target: str) -> Iterable[Refinemen
     return candidates
 
 
+def _noise_refinement_candidates(image: np.ndarray, target_factor: str, baseline_scores: Dict[str, Any]) -> List[RefinementCandidate]:
+    """
+    Generate dynamic, multi-tier, ink-preserving and sharpness-compensated
+    candidates for noise refinement across all noise regimes (20-80 score).
+    """
+    bgr = ensure_bgr(image)
+    gray = _gray(bgr)
+    h, w = gray.shape
+
+    # Ink mask to protect glyphs, matras, and text strokes from blur degradation
+    _, ink = cv2.threshold(gray, 0, 255, cv2.THRESH_BINARY_INV + cv2.THRESH_OTSU)
+    k_size = max(3, (min(h, w) // 150) | 1)
+    kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (k_size, k_size))
+    ink_mask = cv2.dilate(ink, kernel, iterations=1).astype(np.float32) / 255.0
+    ink_mask = cv2.GaussianBlur(ink_mask, (3, 3), 0)[:, :, np.newaxis]
+
+    def _ink_protected(bg_image: np.ndarray, boost: float = 0.35) -> np.ndarray:
+        sharp = _unsharp(bgr, boost, 0.8) if boost > 0 else bgr
+        out = sharp * ink_mask + bg_image * (1.0 - ink_mask)
+        return np.clip(out, 0, 255).astype(np.uint8)
+
+    candidates: List[RefinementCandidate] = []
+
+    # 1. Edge-preserving bilateral with unsharp compensation (preserves Laplacian sharpness)
+    for d, sc, ss, boost in [(5, 30, 30, 0.25), (7, 45, 45, 0.35), (9, 65, 65, 0.45), (5, 75, 75, 0.30)]:
+        den = cv2.bilateralFilter(bgr, d, sc, ss)
+        comp = _unsharp(den, boost, 0.8)
+        candidates.append(_candidate(comp, target_factor, "Compensated edge-preserving bilateral denoising", d=d, sigma_color=sc, boost=boost))
+
+    # 2. Ink-protected bilateral background smoothing
+    for d, sc, ss in [(5, 40, 40), (7, 60, 60), (9, 80, 80)]:
+        bg_den = cv2.bilateralFilter(bgr, d, sc, ss)
+        candidates.append(_candidate(_ink_protected(bg_den, 0.35), target_factor, "Ink-protected bilateral background denoising", d=d, sigma_color=sc))
+
+    # 3. Ink-protected Gaussian background smoothing (for continuous sensor/grain noise)
+    for ksize, sigma in [(3, 0.8), (5, 1.2), (7, 1.6), (9, 2.0)]:
+        bg_den = cv2.GaussianBlur(bgr, (ksize, ksize), sigma)
+        candidates.append(_candidate(_ink_protected(bg_den, 0.35), target_factor, "Ink-protected Gaussian background smoothing", ksize=ksize, sigma=sigma))
+
+    # 4. Ink-protected Median background smoothing (for impulse/speckle noise)
+    for ksize in [3, 5]:
+        bg_den = cv2.medianBlur(bgr, ksize)
+        candidates.append(_candidate(_ink_protected(bg_den, 0.35), target_factor, "Ink-protected median background denoising", ksize=ksize))
+
+    # 5. Background texture normalization + unsharp (for marble/paper texture noise)
+    bg_norm = _background_normalize(bgr)
+    for boost in [0.2, 0.4, 0.6]:
+        candidates.append(_candidate(_unsharp(bg_norm, boost, 0.8), target_factor, "Background texture normalization", boost=boost))
+
+    # 6. Global sharpness-compensated Gaussian denoising
+    for ksize, sigma, boost in [(3, 0.5, 0.25), (3, 0.8, 0.4), (5, 1.0, 0.5), (5, 1.4, 0.6)]:
+        den = cv2.GaussianBlur(bgr, (ksize, ksize), sigma)
+        candidates.append(_candidate(_unsharp(den, boost, 0.8), target_factor, "Sharpness-compensated Gaussian denoising", ksize=ksize, sigma=sigma, boost=boost))
+
+    # 7. Non-local means with unsharp compensation
+    if bgr.shape[0] * bgr.shape[1] <= 4_000_000:
+        for h_param, boost in [(3, 0.25), (5, 0.4)]:
+            den = cv2.fastNlMeansDenoisingColored(bgr, None, h_param, h_param, 5, 15)
+            candidates.append(_candidate(_unsharp(den, boost, 0.8), target_factor, "Sharpness-compensated non-local means", h=h_param, boost=boost))
+
+    return candidates
+
+
 def generate_candidates(target_factor: str, image_bgr: np.ndarray, baseline_scores: Dict[str, Any]) -> List[RefinementCandidate]:
     """Generate a small, factor-specific and de-duplicated candidate set."""
     if target_factor not in FACTOR_KEYS:
@@ -319,12 +382,7 @@ def generate_candidates(target_factor: str, image_bgr: np.ndarray, baseline_scor
 
     candidates: List[RefinementCandidate] = []
     if target_factor == "noise_score":
-        candidates = [
-            _candidate(cv2.GaussianBlur(image, (3, 3), 0.45), target_factor, "Mild Gaussian denoising", kernel=3, sigma=0.45),
-            _candidate(cv2.medianBlur(image, 3), target_factor, "Mild median denoising", kernel=3),
-            _candidate(cv2.bilateralFilter(image, 5, 22, 22), target_factor, "Edge-preserving bilateral denoising", diameter=5, sigma_color=22, sigma_space=22),
-            _candidate(cv2.fastNlMeansDenoisingColored(image, None, 3, 3, 7, 21), target_factor, "Low-strength non-local means denoising", h=3, template=7, search=21),
-        ]
+        candidates = _noise_refinement_candidates(image, target_factor, baseline_scores)
     elif target_factor == "resolution_score":
         candidates = list(_resolution_candidates(image, target_factor))
     elif target_factor == "blur_score":

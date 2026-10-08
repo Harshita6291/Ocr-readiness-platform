@@ -33,11 +33,15 @@ from refinement import (
     RefinementCandidate,
     assess_candidate,
     bgr_to_rgb,
+    cc_refinement_eligibility,
     evaluate_factor_refinement,
+    matra_refinement_eligibility,
+    zone_integrity_refinement_eligibility,
     refinement_eligibility,
     refine_all,
     run_all_factors as refinement_local_scorer,
 )
+
 
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 
@@ -1193,7 +1197,17 @@ if "🏠 Analyse Image" in nav:
                 with info_col:
                     if st.button("ⓘ Info", key=f"refinement_info_{key}", width="stretch"):
                         st.session_state.refinement_info_factor = key
-                eligibility, _eligibility_message = refinement_eligibility(float(sc))
+                # CC Stability, Matra Continuity, and Zone Integrity bypass the generic 'severe' block
+                # so any score < 80 still shows the Refine button. All other factors
+                # continue to use the standard eligibility rule.
+                if key == "connected_component_stability_score":
+                    eligibility, _eligibility_message = cc_refinement_eligibility(float(sc))
+                elif key == "matra_continuity_score":
+                    eligibility, _eligibility_message = matra_refinement_eligibility(float(sc))
+                elif key == "zone_integrity_score":
+                    eligibility, _eligibility_message = zone_integrity_refinement_eligibility(float(sc))
+                else:
+                    eligibility, _eligibility_message = refinement_eligibility(float(sc))
                 with refine_col:
                     if eligibility == "eligible":
                         if st.button("✨ Refine", key=f"refinement_refine_{key}", width="stretch"):
@@ -1276,7 +1290,15 @@ if "🏠 Analyse Image" in nav:
 
             elif refinement_request in DISPLAY_NAMES:
                 shown_score = float(baseline_results.get(refinement_request, {}).get("score", 0.0))
-                eligibility, eligibility_message = refinement_eligibility(shown_score)
+                # CC Stability, Matra Continuity, and Zone Integrity bypass the generic 'severe' block below 20.
+                if refinement_request == "connected_component_stability_score":
+                    eligibility, eligibility_message = cc_refinement_eligibility(shown_score)
+                elif refinement_request == "matra_continuity_score":
+                    eligibility, eligibility_message = matra_refinement_eligibility(shown_score)
+                elif refinement_request == "zone_integrity_score":
+                    eligibility, eligibility_message = zone_integrity_refinement_eligibility(shown_score)
+                else:
+                    eligibility, eligibility_message = refinement_eligibility(shown_score)
                 if eligibility == "severe":
                     st.session_state.refinement_feedback = eligibility_message
                 elif eligibility == "good":
@@ -1298,16 +1320,16 @@ if "🏠 Analyse Image" in nav:
                             final_candidate_scores, final_candidate_api = _score_image_with_existing_pipeline(
                                 Image.fromarray(bgr_to_rgb(candidate.image)), use_apis
                             )
-                        if refinement_request == "blur_score":
-                            # Blur candidates are selected and safety-checked by
-                            # the local scorer. Optional team APIs may use a
-                            # different calibration and must not veto that local
-                            # image refinement.
+                        if refinement_request in ("blur_score", "connected_component_stability_score", "matra_continuity_score", "zone_integrity_score"):
+                            # Blur, CC Stability, Matra, and Zone Integrity candidates are selected and safety-checked
+                            # by the local scorer. Optional team APIs may use a different
+                            # calibration and must not veto that local image refinement.
                             local_candidate_scores = candidate.scores
                             assess_candidate(candidate, local_baseline, local_candidate_scores)
                             candidate.scores = final_candidate_scores
                         else:
                             assess_candidate(candidate, baseline_results, final_candidate_scores)
+
                         if candidate.safe:
                             _store_refinement_preview(
                                 candidate, baseline_image, baseline_results, final_candidate_api

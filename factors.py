@@ -846,7 +846,12 @@ def connected_component_stability_score(img_bgr: np.ndarray) -> Dict[str, Any]:
 
     num_labels, labels, stats, _ = cv2.connectedComponentsWithStats(binary, connectivity=8)
     areas = stats[1:, cv2.CC_STAT_AREA]
-    areas = areas[areas >= 4]  # drop tiny specks
+    heights = stats[1:, cv2.CC_STAT_HEIGHT]
+    widths = stats[1:, cv2.CC_STAT_WIDTH]
+
+    # Filter out isolated 1-3px noise dots while retaining real text glyphs and matras
+    valid_mask = (areas >= 8) | ((heights >= 3) & (widths >= 3) & (areas >= 4))
+    areas = areas[valid_mask]
 
     if len(areas) < 2:
         return {

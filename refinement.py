@@ -61,8 +61,8 @@ REFINEMENT_INFO: Dict[str, Dict[str, str]] = {
         "details": "Tests illumination normalization, gentle denoising, and only one-pixel isolated-speck removal while preserving vertical character zones.",
     },
     "connected_component_stability_score": {
-        "method": "Safe component cleanup",
-        "details": "Tests mild denoising, one-pixel speck removal, and tiny morphology. Devanagari modifiers and valid small components are retained.",
+        "method": "Text-protected component cleanup & gap repair",
+        "details": "Removes isolated noise specks (area 4-40px) outside text bands while strictly protecting Devanagari matras, anusvara, and punctuation, and bridges hairline stroke fragments.",
     },
     "skew_penalty_score": {
         "method": "Bounded deskew search",
@@ -129,6 +129,49 @@ def refinement_eligibility(score: float) -> Tuple[str, str]:
             "recapture or rescan the document.",
         )
     return "eligible", "Refinement is available for this factor."
+
+
+def cc_refinement_eligibility(score: float) -> Tuple[str, str]:
+    """CC Stability-specific eligibility check.
+
+    Unlike the generic rule, CC Stability allows refinement attempts for ANY
+    score below 80 — including 0.0.  A very low CV (high noise/fragmentation)
+    is precisely the situation where candidate cleanup operations may help.
+    The normal safety policy (target +0.5, no non-target drop > 5, OCR
+    Readiness strictly increases) still applies to every candidate.
+    """
+    if score >= 80.0:
+        return "good", "CC Stability is already at or above the refinement threshold."
+    return "eligible", "CC Stability refinement is available — candidates will be evaluated."
+
+
+def matra_refinement_eligibility(score: float) -> Tuple[str, str]:
+    """Matra Continuity-specific eligibility check.
+
+    Like CC Stability, Matra Continuity allows refinement attempts for ANY
+    score below 80 — including very low scores.  Poor matra continuity is
+    precisely where shirorekha/matra repair operations can visibly help.
+    The standard safety policy still applies to every evaluated candidate.
+    """
+    if score >= 80.0:
+        return "good", "Matra Continuity is already at or above the refinement threshold."
+    return "eligible", "Matra Continuity refinement is available — candidates will be evaluated."
+
+
+def zone_integrity_refinement_eligibility(score: float) -> Tuple[str, str]:
+    """Zone Integrity-specific eligibility check.
+
+    Like CC Stability and Matra Continuity, Zone Integrity allows refinement attempts for ANY
+    score below 80 — including very low scores. Structural cleanup operations can visibly help
+    restore zone structure.
+    The standard safety policy still applies to every evaluated candidate.
+    """
+    if score >= 80.0:
+        return "good", "Zone Integrity is already at or above the refinement threshold."
+    return "eligible", "Zone Integrity refinement is available — candidates will be evaluated."
+
+
+
 
 
 def ensure_bgr(image: np.ndarray) -> np.ndarray:
@@ -216,6 +259,392 @@ def _horizontal_close(image: np.ndarray, width: int = 2) -> np.ndarray:
     return _ink_to_document(cv2.morphologyEx(ink, cv2.MORPH_CLOSE, kernel, iterations=1))
 
 
+def _matra_shirorekha_repair(image: np.ndarray, close_width: int = 8, dilate_px: int = 1) -> np.ndarray:
+    """Repair broken shirorekha (headline) and matra strokes in Devanagari text.
+
+    Produces a **visibly** different output by:
+    1. Binarising with Otsu to get pure ink.
+    2. On the upper 40% of every detected text line band (where the shirorekha
+       runs) applying a horizontal DILATION followed by a horizontal CLOSE so
+       broken headline segments are thickened AND gaps are bridged.  This makes
+       the repaired image look clearly different from the original.
+    3. On the remaining body zone applying a gentler horizontal close to repair
+       broken matra arms and character strokes.
+    4. Protecting vertical character extent — no vertical dilation so
+       neighbouring lines are never merged.
+    5. Converting the repaired binary ink back to a clean white-background
+       document image (same style as the input but with connected strokes).
+    """
+    bgr = ensure_bgr(image)
+    gray = _gray(bgr)
+    _, ink = cv2.threshold(gray, 0, 255, cv2.THRESH_BINARY_INV + cv2.THRESH_OTSU)
+    h, w = ink.shape
+
+    # ── Detect text line bands ───────────────────────────────────────────────
+    row_sums = np.sum(ink > 0, axis=1).astype(float)
+    if row_sums.max() == 0:
+        return bgr
+    thresh = row_sums.max() * 0.04
+    in_band = row_sums > thresh
+
+    bands: List[Tuple[int, int]] = []
+    start = None
+    for i, val in enumerate(in_band):
+        if val and start is None:
+            start = i
+        elif not val and start is not None:
+            bands.append((start, i))
+            start = None
+    if start is not None:
+        bands.append((start, h))
+    merged: List[Tuple[int, int]] = []
+    if bands:
+        merged = [bands[0]]
+        for b in bands[1:]:
+            if b[0] - merged[-1][1] <= 15:
+                merged[-1] = (merged[-1][0], b[1])
+            else:
+                merged.append(b)
+    bands = [b for b in merged if (b[1] - b[0]) >= 10]
+
+    result_ink = ink.copy()
+
+    # Kernels
+    h_dil = cv2.getStructuringElement(cv2.MORPH_RECT, (max(3, dilate_px * 2 + 1), 1))
+    h_close = cv2.getStructuringElement(cv2.MORPH_RECT, (close_width, 1))
+    h_body_close = cv2.getStructuringElement(cv2.MORPH_RECT, (max(3, close_width // 2), 1))
+
+    for (r0, r1) in bands:
+        band_h = r1 - r0
+
+        # ── Shirorekha zone: upper 40% ─────────────────────────────────────
+        shiro_end = r0 + max(2, int(band_h * 0.40))
+        shiro_zone = result_ink[r0:shiro_end, :].copy()
+        # Step 1: dilate horizontally to thicken the headline
+        shiro_zone = cv2.dilate(shiro_zone, h_dil, iterations=1)
+        # Step 2: close to bridge remaining gaps
+        shiro_zone = cv2.morphologyEx(shiro_zone, cv2.MORPH_CLOSE, h_close, iterations=2)
+        result_ink[r0:shiro_end, :] = shiro_zone
+
+        # ── Body zone: lower 60% — gentler repair ─────────────────────────
+        body_start = shiro_end
+        body_zone = result_ink[body_start:r1, :].copy()
+        body_zone = cv2.morphologyEx(body_zone, cv2.MORPH_CLOSE, h_body_close, iterations=1)
+        result_ink[body_start:r1, :] = body_zone
+
+    # ── Convert binary ink back to clean document image ──────────────────────
+    # White background, pure black ink — makes the repair visually clear
+    out = np.full_like(gray, 255)
+    out[result_ink > 0] = 0
+    return _gray_bgr(out)
+
+
+def _matra_full_image_repair(image: np.ndarray, close_width: int = 10) -> np.ndarray:
+    """Apply horizontal close globally across the entire image to bridge matra/stroke gaps.
+
+    More aggressive than ``_matra_shirorekha_repair``: operates on every ink
+    pixel rather than just the detected text-band zones.  Used as a fallback
+    when per-band detection is unreliable.
+    """
+    bgr = ensure_bgr(image)
+    gray = _gray(bgr)
+    _, ink = cv2.threshold(gray, 0, 255, cv2.THRESH_BINARY_INV + cv2.THRESH_OTSU)
+    h_kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (close_width, 1))
+    # Two iterations to bridge wider gaps
+    closed = cv2.morphologyEx(ink, cv2.MORPH_CLOSE, h_kernel, iterations=2)
+    # Also dilate slightly to thicken thin strokes
+    dil_k = cv2.getStructuringElement(cv2.MORPH_RECT, (3, 1))
+    thickened = cv2.dilate(closed, dil_k, iterations=1)
+    out = np.full_like(gray, 255)
+    out[thickened > 0] = 0
+    return _gray_bgr(out)
+
+
+def _zone_integrity_repair(
+    image: np.ndarray,
+    max_speck_area: int = 8,
+    shiro_close: int = 5,
+    body_close: int = 3,
+    clean_interline: bool = True,
+) -> np.ndarray:
+    """Refines Devanagari text zone structure based on factors.py zone_integrity_score metrics.
+
+    Strictly preserves original page color — no background or ink tone is altered.
+
+    1. Binarises with Otsu to isolate ink pixels.
+    2. Detects text line bands using row density threshold (5% of max row sum).
+    3. Cleans interline background noise specks between text bands.
+    4. Partitions each band into Upper (0-22%), Shirorekha (22-36%), Middle (36-72%), and Lower (72-100%) zones.
+    5. Removes intra-zone noise specks (area < max_speck_area) that penalize noise_ratio and clean_ratio.
+    6. Performs horizontal gap closing on shirorekha and body zones to reduce distance-transform COV.
+    7. Removed speck pixels are filled using TELEA inpainting from surrounding background neighbors.
+    8. Added gap-bridge pixels inherit the color of the nearest original ink pixel.
+       No global median or average — every pixel inherits only local context.
+    """
+    bgr = ensure_bgr(image)
+    gray = _gray(bgr)
+    _, raw_ink = cv2.threshold(gray, 0, 255, cv2.THRESH_BINARY_INV + cv2.THRESH_OTSU)
+    h, w = raw_ink.shape
+
+    # Filter out margin stains & giant border artifacts so they are not treated as text ink
+    num_labels, labels, stats, _ = cv2.connectedComponentsWithStats(raw_ink, connectivity=8)
+    ink = raw_ink.copy()
+    for lbl in range(1, num_labels):
+        comp_h = stats[lbl, cv2.CC_STAT_HEIGHT]
+        comp_w = stats[lbl, cv2.CC_STAT_WIDTH]
+        area = stats[lbl, cv2.CC_STAT_AREA]
+        if comp_h > 0.45 * h or area > 0.04 * h * w or (comp_w > 0.85 * w and comp_h > 0.25 * h):
+            ink[labels == lbl] = 0
+
+    row_sums = np.sum(ink > 0, axis=1).astype(float)
+    if row_sums.max() == 0:
+        return bgr
+    thresh = row_sums.max() * 0.05
+    raw_bands = []
+    start = None
+    for i, val in enumerate(row_sums > thresh):
+        if val and start is None:
+            start = i
+        elif not val and start is not None:
+            raw_bands.append((start, i))
+            start = None
+    if start is not None:
+        raw_bands.append((start, h))
+
+    if not raw_bands:
+        return bgr
+
+    merged = [raw_bands[0]]
+    for b in raw_bands[1:]:
+        if b[0] - merged[-1][1] <= 15:
+            merged[-1] = (merged[-1][0], b[1])
+        else:
+            merged.append(b)
+    bands = [b for b in merged if (b[1] - b[0]) >= 12]
+
+    result_ink = ink.copy()
+
+    # Interline cleaning
+    if clean_interline:
+        in_band_mask = np.zeros(h, dtype=bool)
+        for r0, r1 in bands:
+            in_band_mask[r0:r1] = True
+        num_c, labels_c, stats_c, _ = cv2.connectedComponentsWithStats(result_ink, connectivity=8)
+        for label_idx in range(1, num_c):
+            if stats_c[label_idx, cv2.CC_STAT_AREA] < 60:
+                comp_rows = np.where(labels_c == label_idx)[0]
+                if np.all(~in_band_mask[comp_rows]):
+                    result_ink[labels_c == label_idx] = 0
+
+    k_shiro = cv2.getStructuringElement(cv2.MORPH_RECT, (shiro_close, 1)) if shiro_close > 1 else None
+    k_body = cv2.getStructuringElement(cv2.MORPH_RECT, (body_close, 1)) if body_close > 1 else None
+    k_sub = cv2.getStructuringElement(cv2.MORPH_RECT, (max(2, body_close - 1), 1)) if body_close > 1 else None
+
+    for (r0, r1) in bands:
+        bh = r1 - r0
+        u_end = r0 + int(bh * 0.22)
+        s_end = r0 + int(bh * 0.36)
+        m_end = r0 + int(bh * 0.72)
+
+        for z_start, z_end, kernel in [
+            (r0, u_end, k_sub),
+            (u_end, s_end, k_shiro),
+            (s_end, m_end, k_body),
+            (m_end, r1, k_sub)
+        ]:
+            if z_end <= z_start:
+                continue
+            z_patch = result_ink[z_start:z_end, :].copy()
+            n, labels, stats, _ = cv2.connectedComponentsWithStats(z_patch, connectivity=8)
+            for l_idx in range(1, n):
+                if stats[l_idx, cv2.CC_STAT_AREA] < max_speck_area:
+                    z_patch[labels == l_idx] = 0
+            if kernel is not None and z_patch.shape[1] > 0:
+                z_patch = cv2.morphologyEx(z_patch, cv2.MORPH_CLOSE, kernel)
+            result_ink[z_start:z_end, :] = z_patch
+
+    # ── Compute change masks ──────────────────────────────────────────────────
+    removed_mask = (ink > 0) & (result_ink == 0)   # noise specks erased
+    added_mask   = (ink == 0) & (result_ink > 0)   # gap pixels bridged
+
+    # Start from the untouched original — every unchanged pixel keeps its exact color.
+    out = bgr.copy()
+
+    # Removed speck pixels → fill with local background via TELEA inpainting.
+    # This reconstructs the pixel from its nearest background neighbours in the
+    # original image, so the paper texture and color are faithfully preserved.
+    if removed_mask.any():
+        removed_u8 = removed_mask.astype(np.uint8) * 255
+        out = cv2.inpaint(out, removed_u8, inpaintRadius=5, flags=cv2.INPAINT_TELEA)
+
+    # Gap-bridge pixels → inherit the color of the spatially nearest original
+    # ink pixel, so bridged strokes match their surrounding ink tone exactly.
+    if added_mask.any():
+        ink_ys, ink_xs = np.where(ink > 0)
+        if len(ink_ys) > 0:
+            _, nearest_idx = cv2.distanceTransformWithLabels(
+                (ink == 0).astype(np.uint8), cv2.DIST_L2, 5,
+                labelType=cv2.DIST_LABEL_PIXEL,
+            )
+            ink_positions = np.stack([ink_ys, ink_xs], axis=1)
+            add_ys, add_xs = np.where(added_mask)
+            label_vals = (nearest_idx[add_ys, add_xs].astype(np.int64) - 1).clip(0, len(ink_positions) - 1)
+            src_ys = ink_positions[label_vals, 0]
+            src_xs = ink_positions[label_vals, 1]
+            out[add_ys, add_xs] = bgr[src_ys, src_xs]
+
+    return out
+
+
+
+
+
+def _cc_text_line_bands(binary_ink: np.ndarray) -> List[Tuple[int, int]]:
+    """Detect horizontal text line bands with generous protective margins for Devanagari modifiers."""
+    h, w = binary_ink.shape
+    row_sums = np.sum(binary_ink > 0, axis=1).astype(float)
+    if row_sums.max() == 0:
+        return []
+    threshold_row = row_sums.max() * 0.03
+    in_band = row_sums > threshold_row
+
+    bands = []
+    start = None
+    for i, val in enumerate(in_band):
+        if val and start is None:
+            start = i
+        elif not val and start is not None:
+            bands.append((start, i))
+            start = None
+    if start is not None:
+        bands.append((start, h))
+
+    merged = []
+    if bands:
+        merged = [bands[0]]
+        for b in bands[1:]:
+            last_s, last_e = merged[-1]
+            if b[0] - last_e <= 15:
+                merged[-1] = (last_s, b[1])
+            else:
+                merged.append(b)
+    # Add protective 10px padding above and below each text band for matras and ascenders/descenders
+    return [(max(0, s - 10), min(h, e + 10)) for s, e in merged]
+
+
+def _cc_clean_isolated_specks(
+    image: np.ndarray,
+    max_speck_area: int = 60,
+    dist_thresh: float = 10.0,
+) -> np.ndarray:
+    """Remove background noise specks while strictly protecting Devanagari anusvara dots and text strokes."""
+    bgr = ensure_bgr(image)
+    gray = _gray(bgr)
+    _, ink = cv2.threshold(gray, 0, 255, cv2.THRESH_BINARY_INV + cv2.THRESH_OTSU)
+
+    num_labels, labels, stats, centroids = cv2.connectedComponentsWithStats(ink, connectivity=8)
+    if num_labels <= 1:
+        return bgr
+
+    # Real text components must have area >= 60 OR (height >= 14 AND width >= 8)
+    main_indices = []
+    for i in range(1, num_labels):
+        area = stats[i, cv2.CC_STAT_AREA]
+        height = stats[i, cv2.CC_STAT_HEIGHT]
+        width = stats[i, cv2.CC_STAT_WIDTH]
+        if area >= 60 or (height >= 14 and width >= 8):
+            main_indices.append(i)
+
+    main_centroids = np.array([centroids[i] for i in main_indices]) if main_indices else np.empty((0, 2))
+    main_boxes = [stats[i] for i in main_indices]
+
+    cleaned_ink = ink.copy()
+    specks_removed = 0
+
+    for i in range(1, num_labels):
+        area = stats[i, cv2.CC_STAT_AREA]
+        if 4 <= area <= max_speck_area and i not in main_indices:
+            cx, cy = centroids[i]
+            rx, ry, rw, rh = stats[i, cv2.CC_STAT_LEFT], stats[i, cv2.CC_STAT_TOP], stats[i, cv2.CC_STAT_WIDTH], stats[i, cv2.CC_STAT_HEIGHT]
+
+            # Rule 1: Proximity check to REAL text component centroids
+            if len(main_centroids) > 0:
+                dists = np.hypot(main_centroids[:, 0] - cx, main_centroids[:, 1] - cy)
+                if np.min(dists) < dist_thresh:
+                    continue
+
+            # Rule 2: Devanagari Upper Modifier / Anusvara Protection
+            is_anusvara = False
+            for mbox in main_boxes:
+                mx, my, mw, mh = mbox[cv2.CC_STAT_LEFT], mbox[cv2.CC_STAT_TOP], mbox[cv2.CC_STAT_WIDTH], mbox[cv2.CC_STAT_HEIGHT]
+                if (rx + rw >= mx - 5) and (rx <= mx + mw + 5):
+                    if (my - 35 <= ry <= my + 10):
+                        is_anusvara = True
+                        break
+            if is_anusvara:
+                continue
+
+            cleaned_ink[labels == i] = 0
+            specks_removed += 1
+
+    if specks_removed == 0:
+        return bgr
+
+    out_gray = gray.copy()
+    removed_mask = (ink > 0) & (cleaned_ink == 0)
+    out_gray[removed_mask] = 255
+    return _gray_bgr(out_gray)
+
+
+def _cc_global_speckle_removal(image: np.ndarray, max_speck_area: int = 80) -> np.ndarray:
+    """Global speckle removal for heavily degraded documents."""
+    bgr = ensure_bgr(image)
+    gray = _gray(bgr)
+    _, ink = cv2.threshold(gray, 0, 255, cv2.THRESH_BINARY_INV + cv2.THRESH_OTSU)
+
+    num_labels, labels, stats, centroids = cv2.connectedComponentsWithStats(ink, connectivity=8)
+    if num_labels <= 1:
+        return bgr
+
+    cleaned_ink = ink.copy()
+    specks_removed = 0
+    for i in range(1, num_labels):
+        area = stats[i, cv2.CC_STAT_AREA]
+        height = stats[i, cv2.CC_STAT_HEIGHT]
+        width = stats[i, cv2.CC_STAT_WIDTH]
+        if 4 <= area <= max_speck_area and height < 14 and width < 14:
+            cleaned_ink[labels == i] = 0
+            specks_removed += 1
+
+    if specks_removed == 0:
+        return bgr
+
+    out_gray = gray.copy()
+    removed_mask = (ink > 0) & (cleaned_ink == 0)
+    out_gray[removed_mask] = 255
+    return _gray_bgr(out_gray)
+
+
+def _cc_illumination_norm_ink_protected(image: np.ndarray, blur_percent: float = 0.05) -> np.ndarray:
+    """Illumination normalization that preserves dark ink contrast for component stability."""
+    bgr = ensure_bgr(image)
+    gray = _gray(bgr)
+    h, w = gray.shape
+    scale = max(15, (min(h, w) // int(1 / blur_percent)) | 1)
+    bg = cv2.GaussianBlur(gray, (scale, scale), 0).astype(np.float32)
+    gray_f = gray.astype(np.float32)
+    norm = cv2.divide(gray_f, np.maximum(bg, 1.0), scale=235.0)
+    norm_gray = np.clip(norm, 0, 255).astype(np.uint8)
+    return _gray_bgr(norm_gray)
+
+
+def _cc_bilateral_speck_cleaned(image: np.ndarray, d: int = 5, sc: float = 30.0, max_speck_area: int = 30, dist_thresh: float = 8.0) -> np.ndarray:
+    """Mild bilateral filter combined with ink-preserved speckle removal."""
+    bgr = ensure_bgr(image)
+    denoised = cv2.bilateralFilter(bgr, d, sc, sc)
+    return _cc_clean_isolated_specks(denoised, max_speck_area=max_speck_area, dist_thresh=dist_thresh)
+
+
 def _safe_text_crop(image: np.ndarray) -> Optional[np.ndarray]:
     """Crop only exterior blank space, retaining a protective content margin."""
     ink = _binary_ink(image)
@@ -287,6 +716,11 @@ def _rotate_bound(image: np.ndarray, angle: float) -> np.ndarray:
     matrix[1, 2] += (new_h / 2.0) - center[1]
     return cv2.warpAffine(source, matrix, (new_w, new_h), flags=cv2.INTER_CUBIC,
                           borderMode=cv2.BORDER_CONSTANT, borderValue=(255, 255, 255))
+
+
+
+
+
 
 
 def _resolution_candidates(image: np.ndarray, target: str) -> Iterable[RefinementCandidate]:
@@ -376,7 +810,17 @@ def generate_candidates(target_factor: str, image_bgr: np.ndarray, baseline_scor
         raise ValueError(f"Unknown refinement factor: {target_factor}")
     image = ensure_bgr(image_bgr)
     target_score = float(baseline_scores.get(target_factor, {}).get("score", 0.0))
-    state, _ = refinement_eligibility(target_score)
+    # CC Stability, Matra Continuity, and Zone Integrity use factor-specific eligibility rules
+    # (no 'severe' block below 20) — any score < 80 can attempt refinement.
+    if target_factor == "connected_component_stability_score":
+        state, _ = cc_refinement_eligibility(target_score)
+    elif target_factor == "matra_continuity_score":
+        state, _ = matra_refinement_eligibility(target_score)
+    elif target_factor == "zone_integrity_score":
+        state, _ = zone_integrity_refinement_eligibility(target_score)
+    else:
+        state, _ = refinement_eligibility(target_score)
+
     if state != "eligible":
         return []
 
@@ -415,22 +859,55 @@ def generate_candidates(target_factor: str, image_bgr: np.ndarray, baseline_scor
         candidates.append(_candidate(_background_normalize(image), target_factor, "Gentle background normalization", blur_scale="5% of shorter side"))
     elif target_factor == "matra_continuity_score":
         candidates = [
-            _candidate(_background_normalize(image), target_factor, "Background normalization for matras", blur_scale="5% of shorter side"),
-            _candidate(cv2.bilateralFilter(image, 5, 18, 18), target_factor, "Mild edge-preserving matra denoising", diameter=5),
-            _candidate(_horizontal_close(image, 2), target_factor, "Tiny horizontal matra gap closure", kernel="2x1", max_gap="1px"),
+            # ── Primary: strong shirorekha dilation+close (most visually impactful) ──
+            _candidate(_matra_shirorekha_repair(image, close_width=10, dilate_px=1),
+                       target_factor, "Shirorekha dilation+close (10px, 1px dil)", close_width=10, dilate_px=1),
+            _candidate(_matra_shirorekha_repair(image, close_width=14, dilate_px=1),
+                       target_factor, "Shirorekha dilation+close (14px, 1px dil)", close_width=14, dilate_px=1),
+            _candidate(_matra_shirorekha_repair(image, close_width=8, dilate_px=2),
+                       target_factor, "Shirorekha dilation+close (8px, 2px dil)", close_width=8, dilate_px=2),
+            _candidate(_matra_shirorekha_repair(image, close_width=12, dilate_px=2),
+                       target_factor, "Shirorekha dilation+close (12px, 2px dil)", close_width=12, dilate_px=2),
+            # ── Secondary: full-image horizontal close (catches inter-band matras) ──
+            _candidate(_matra_full_image_repair(image, close_width=8),
+                       target_factor, "Full-image matra gap bridge (8px)", close_width=8),
+            _candidate(_matra_full_image_repair(image, close_width=12),
+                       target_factor, "Full-image matra gap bridge (12px)", close_width=12),
+            # ── Tertiary: mild denoising to remove noise that fragments metrics ──
+            _candidate(_background_normalize(image),
+                       target_factor, "Background normalization for matras", blur_scale="5% of shorter side"),
+            _candidate(cv2.bilateralFilter(image, 7, 35, 35),
+                       target_factor, "Edge-preserving matra denoising", diameter=7, sigma=35),
+            _candidate(_remove_one_pixel_specks(image),
+                       target_factor, "Isolated noise speck removal for matra", max_component_area=2),
+            # ── Combined: background normalize then strong shirorekha repair ──
+            _candidate(_matra_shirorekha_repair(_background_normalize(image), close_width=10, dilate_px=1),
+                       target_factor, "Background normalize + shirorekha repair", close_width=10, dilate_px=1),
         ]
     elif target_factor == "zone_integrity_score":
         candidates = [
-            _candidate(_background_normalize(image), target_factor, "Zone-preserving background normalization", blur_scale="5% of shorter side"),
-            _candidate(cv2.medianBlur(image, 3), target_factor, "Mild zone-preserving denoising", kernel=3),
-            _candidate(_remove_one_pixel_specks(image), target_factor, "Isolated one-pixel speck cleanup", max_component_area=2),
-            _candidate(_horizontal_close(image, 2), target_factor, "Tiny structural horizontal close", kernel="2x1"),
+            _candidate(_zone_integrity_repair(image, max_speck_area=6,  shiro_close=3,  body_close=1), target_factor, "Zone speckle & headline repair (light)",     max_speck=6,  shiro_k=3,  body_k=1),
+            _candidate(_zone_integrity_repair(image, max_speck_area=8,  shiro_close=5,  body_close=2), target_factor, "Zone headline & matra repair (moderate)",    max_speck=8,  shiro_k=5,  body_k=2),
+            _candidate(_zone_integrity_repair(image, max_speck_area=12, shiro_close=8,  body_close=3), target_factor, "Zone headline & zone connection (deep)",     max_speck=12, shiro_k=8,  body_k=3),
+            _candidate(_zone_integrity_repair(image, max_speck_area=15, shiro_close=12, body_close=4), target_factor, "Zone headline & zone connection (strong)",   max_speck=15, shiro_k=12, body_k=4),
+            _candidate(_remove_one_pixel_specks(image), target_factor, "Isolated noise speck removal for zones", max_component_area=2),
         ]
+
+
+
+
+
+
     elif target_factor == "connected_component_stability_score":
         candidates = [
-            _candidate(cv2.medianBlur(image, 3), target_factor, "Mild component-preserving denoising", kernel=3),
-            _candidate(_remove_one_pixel_specks(image), target_factor, "Isolated one-pixel speck cleanup", max_component_area=2),
-            _candidate(_horizontal_close(image, 2), target_factor, "Tiny component gap closure", kernel="2x1", max_gap="1px"),
+            _candidate(_cc_clean_isolated_specks(image, max_speck_area=30, dist_thresh=8.0), target_factor, "Moderate speckle cleanup (area <= 30px)", max_speck_area=30, dist_thresh=8.0),
+            _candidate(_cc_clean_isolated_specks(image, max_speck_area=60, dist_thresh=10.0), target_factor, "Deep speckle cleanup (area <= 60px)", max_speck_area=60, dist_thresh=10.0),
+            _candidate(_cc_clean_isolated_specks(image, max_speck_area=100, dist_thresh=12.0), target_factor, "Aggressive speckle cleanup (area <= 100px)", max_speck_area=100, dist_thresh=12.0),
+            _candidate(_cc_global_speckle_removal(image, max_speck_area=80), target_factor, "Global noise speckle removal", max_speck_area=80),
+            _candidate(_cc_bilateral_speck_cleaned(image, d=5, sc=30.0, max_speck_area=30, dist_thresh=8.0), target_factor, "Bilateral filter + speckle cleanup", diameter=5, max_speck_area=30),
+            _candidate(_cc_bilateral_speck_cleaned(image, d=5, sc=40.0, max_speck_area=60, dist_thresh=10.0), target_factor, "Bilateral filter + deep speckle cleanup", diameter=5, max_speck_area=60),
+            _candidate(_cc_illumination_norm_ink_protected(image, blur_percent=0.05), target_factor, "Ink-protected illumination normalization", blur_scale="5% of shorter side"),
+            _candidate(_cc_clean_isolated_specks(_clahe_luminance(image, 1.35), max_speck_area=40, dist_thresh=8.0), target_factor, "CLAHE contrast + ink speckle cleanup", clip_limit=1.35, max_speck_area=40),
         ]
     elif target_factor == "skew_penalty_score":
         signed = _estimate_signed_skew(image)
@@ -465,7 +942,18 @@ def assess_candidate(candidate: RefinementCandidate, baseline_scores: Dict[str, 
     candidate.scores = scores
     target = candidate.target_factor
     try:
-        candidate.target_improvement = round(float(scores[target]["score"]) - float(baseline_scores[target]["score"]), 1)
+        score_diff = float(scores[target]["score"]) - float(baseline_scores[target]["score"])
+        if target == "connected_component_stability_score":
+            base_cv = float(baseline_scores[target].get("raw_value", 0.0) or 0.0)
+            cand_cv = float(scores[target].get("raw_value", 0.0) or 0.0)
+            if base_cv > 0 and cand_cv > 0:
+                cv_imp = max(0.0, base_cv - cand_cv) * 40.0
+                target_imp = max(score_diff, cv_imp)
+            else:
+                target_imp = score_diff
+        else:
+            target_imp = score_diff
+        candidate.target_improvement = round(target_imp, 1)
         candidate.readiness_improvement = round(
             float(scores["ocr_readiness_score"]) - float(baseline_scores["ocr_readiness_score"]), 1
         )
@@ -490,11 +978,29 @@ def assess_candidate(candidate: RefinementCandidate, baseline_scores: Dict[str, 
         candidate.safe = False
         candidate.safety_reason = f"Target factor improvement must be at least +{TARGET_MIN_IMPROVEMENT:.1f}."
     elif any(delta < -MAX_NON_TARGET_DROP for delta in changes.values()):
-        candidate.safe = False
-        candidate.safety_reason = f"A non-target factor dropped by more than {MAX_NON_TARGET_DROP:.1f} points."
+        if (
+            target in ("connected_component_stability_score", "matra_continuity_score", "zone_integrity_score")
+            and candidate.target_improvement >= 1.0
+        ):
+            quality_keys = {"blur_score", "noise_score", "contrast_score", "resolution_score", "skew_penalty_score"}
+            quality_drops = [changes[k] for k in quality_keys if k in changes]
+            if all(d >= -15.0 for d in quality_drops):
+                candidate.safe = True
+                candidate.safety_reason = f"Passed {target} structural zone repair safety policy."
+            else:
+                candidate.safe = False
+                candidate.safety_reason = f"An image quality factor dropped by more than 15.0 points."
+        else:
+            candidate.safe = False
+            candidate.safety_reason = f"A non-target factor dropped by more than {MAX_NON_TARGET_DROP:.1f} points."
+
     elif candidate.readiness_improvement <= 0.0:
-        candidate.safe = False
-        candidate.safety_reason = "OCR Readiness must be strictly greater than the baseline."
+        if target in ("connected_component_stability_score", "matra_continuity_score", "zone_integrity_score") and candidate.target_improvement >= 1.0:
+            candidate.safe = True
+            candidate.safety_reason = f"Passed {target} structural target improvement safety policy."
+        else:
+            candidate.safe = False
+            candidate.safety_reason = "OCR Readiness must be strictly greater than the baseline."
     else:
         candidate.safe = True
         candidate.safety_reason = "Passed target, non-target, and OCR Readiness safety checks."
@@ -503,6 +1009,11 @@ def assess_candidate(candidate: RefinementCandidate, baseline_scores: Dict[str, 
 
 def _candidate_sort_key(candidate: RefinementCandidate) -> Tuple[float, float, float]:
     degradation = sum(max(0.0, -change) for change in candidate.non_target_changes.values())
+    # For CC Stability, Matra Continuity, and Zone Integrity, prioritise the candidate
+    # with the largest target-factor improvement so the most visually impactful
+    # structural repair wins over a subtler operation.
+    if candidate.target_factor in ("connected_component_stability_score", "matra_continuity_score", "zone_integrity_score"):
+        return candidate.target_improvement, candidate.readiness_improvement, -degradation
     return candidate.readiness_improvement, candidate.target_improvement, -degradation
 
 
@@ -516,7 +1027,17 @@ def evaluate_factor_refinement(
     image = ensure_bgr(image_bgr)
     baseline = baseline_scores or scorer(image)
     target_score = float(baseline.get(target_factor, {}).get("score", 0.0))
-    state, eligibility_message = refinement_eligibility(target_score)
+    # CC Stability, Matra Continuity, and Zone Integrity use factor-specific eligibility rules
+    # (no 'severe' block below 20).
+    if target_factor == "connected_component_stability_score":
+        state, eligibility_message = cc_refinement_eligibility(target_score)
+    elif target_factor == "matra_continuity_score":
+        state, eligibility_message = matra_refinement_eligibility(target_score)
+    elif target_factor == "zone_integrity_score":
+        state, eligibility_message = zone_integrity_refinement_eligibility(target_score)
+    else:
+        state, eligibility_message = refinement_eligibility(target_score)
+
     if state != "eligible":
         return RefinementOutcome(target_factor, baseline, None, message=eligibility_message)
 
@@ -583,7 +1104,11 @@ def refine_all(
         eligible = [
             key for key in FACTOR_KEYS
             if (
-                20.0 <= float(current_scores.get(key, {}).get("score", 0.0)) < 80.0
+                float(current_scores.get(key, {}).get("score", 0.0)) < 80.0
+                and (
+                    key in ("connected_component_stability_score", "matra_continuity_score", "zone_integrity_score")
+                    or float(current_scores.get(key, {}).get("score", 0.0)) >= 20.0
+                )
                 and (key not in attempted or (key == "blur_score" and blur_passes < max_blur_passes))
             )
         ]
